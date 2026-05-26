@@ -22,7 +22,7 @@
 #include "install_paths.h"
 
 #define MAX_ROTATIONS 15
-#define BACKUP_DIR PIHOLE_INSTALL_DIR "/config_backups"
+#define BACKUP_DIR "/var/lib/pihole/config_backups"
 
 bool chmod_file(const char *filename, const mode_t mode);
 bool file_exists(const char *filename);
