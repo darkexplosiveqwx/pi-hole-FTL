@@ -71,6 +71,8 @@ endif()
 # If CI_ARCH is unset (local compilation), ask uname -m and add locally compiled comment
 if(DEFINED ENV{CI_ARCH})
     set(FTL_ARCH "$ENV{CI_ARCH} (compiled on CI)")
+elseif(DEFINED ENV{MOCK_ARCH})
+    set(FTL_ARCH "$ENV{MOCK_ARCH} (compiled in mock)")
 else()
     execute_process(
             COMMAND           uname -m

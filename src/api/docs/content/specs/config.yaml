@@ -1064,7 +1064,7 @@ components:
               cert: "@PIHOLE_INSTALL_DIR@/tls.pem"
               validity: 47
             paths:
-              webroot: "/var/www/html"
+              webroot: "/usr/share/pihole/www"
               webhome: "/admin/"
               prefix: ""
             interface:
@@ -1089,10 +1089,10 @@ components:
                 limit: 60.0
                 unit: "C"
           files:
-            database: "@PIHOLE_INSTALL_DIR@/pihole-FTL.db"
-            gravity: "@PIHOLE_INSTALL_DIR@/gravity.db"
+            database: "/var/lib/pihole/pihole-FTL.db"
+            gravity: "/var/lib/pihole/gravity.db"
             gravity_tmp: "/tmp"
-            macvendor: "@PIHOLE_INSTALL_DIR@/macvendor.db"
+            macvendor: "/usr/share/pihole/macvendor.db"
             pcap: ""
             log:
               ftl: "/var/log/pihole/FTL.log"

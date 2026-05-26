@@ -37,6 +37,6 @@ bool write_custom_list(void);
 #define DNSMASQ_CUSTOM_LIST DNSMASQ_HOSTSDIR"/custom.list"
 #define DNSMASQ_CUSTOM_LIST_LEGACY PIHOLE_INSTALL_DIR "/custom.list"
 #define DNSMASQ_CUSTOM_LIST_LEGACY_TARGET MIGRATION_TARGET_V6"/custom.list"
-#define DHCPLEASESFILE PIHOLE_INSTALL_DIR "/dhcp.leases"
+#define DHCPLEASESFILE "/var/lib/pihole/dhcp.leases"
 
 #endif //DNSMASQ_CONFIG_H

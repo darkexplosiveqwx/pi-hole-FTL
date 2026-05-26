@@ -1213,7 +1213,7 @@ void initConfig(struct config *conf)
 	conf->webserver.paths.webroot.a = cJSON_CreateStringReference("A valid absolute path not containing \""CONFIG_DIR"\"");
 	conf->webserver.paths.webroot.t = CONF_STRING;
 	conf->webserver.paths.webroot.f = FLAG_RESTART_FTL | FLAG_API_READ_ONLY;
-	conf->webserver.paths.webroot.d.s = (char*)"/var/www/html";
+	conf->webserver.paths.webroot.d.s = (char*)"/usr/share/pihole/www";
 	conf->webserver.paths.webroot.c = validate_webroot;
 
 	conf->webserver.paths.webhome.k = "webserver.paths.webhome";
@@ -1385,7 +1385,7 @@ void initConfig(struct config *conf)
 	conf->files.database.a = cJSON_CreateStringReference("Any FTL database");
 	conf->files.database.t = CONF_STRING;
 	conf->files.database.f = FLAG_RESTART_FTL;
-	conf->files.database.d.s = (char*)(PIHOLE_INSTALL_DIR "/pihole-FTL.db");
+	conf->files.database.d.s = (char*)"/var/lib/pihole/pihole-FTL.db";
 	conf->files.database.c = validate_filepath;
 
 	conf->files.gravity.k = "files.gravity";
@@ -1393,7 +1393,7 @@ void initConfig(struct config *conf)
 	conf->files.gravity.a = cJSON_CreateStringReference("Any Pi-hole gravity database");
 	conf->files.gravity.t = CONF_STRING;
 	conf->files.gravity.f = FLAG_RESTART_FTL;
-	conf->files.gravity.d.s = (char*)(PIHOLE_INSTALL_DIR "/gravity.db");
+	conf->files.gravity.d.s = (char*)"/var/lib/pihole/gravity.db";
 	conf->files.gravity.c = validate_filepath;
 
 	conf->files.gravity_tmp.k = "files.gravity_tmp";
@@ -1408,7 +1408,7 @@ void initConfig(struct config *conf)
 	conf->files.macvendor.h = "The database containing MAC -> Vendor information for the network table";
 	conf->files.macvendor.a = cJSON_CreateStringReference("Any Pi-hole macvendor database");
 	conf->files.macvendor.t = CONF_STRING;
-	conf->files.macvendor.d.s = (char*)(PIHOLE_INSTALL_DIR "/macvendor.db");
+	conf->files.macvendor.d.s = (char*)"/usr/share/pihole/macvendor.db";
 	conf->files.macvendor.c = validate_filepath;
 
 	conf->files.pcap.k = "files.pcap";
