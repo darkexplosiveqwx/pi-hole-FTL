@@ -19,5 +19,6 @@ bool readFTLtoml(struct config *oldconf, struct config *newconf,
                  const unsigned int version, const bool teleporter,
                  char err[VALIDATOR_ERRBUF_LEN]);
 bool getLogFilePathTOML(void);
+bool getLogDestinationTOML(void);
 
 #endif //TOML_READER_H
