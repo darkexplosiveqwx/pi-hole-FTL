@@ -30,6 +30,10 @@
 #include "gc.h"
 // open(), O_WRONLY, O_CREAT, O_APPEND, O_CLOEXEC
 #include <fcntl.h>
+#ifdef HAVE_LIBJOURNAL
+// journal_send(), journal_init()
+#include <journal.h>
+#endif
 
 static bool print_log = true, print_stdout = true;
 bool debug_flags[DEBUG_MAX] = { false };
@@ -68,11 +72,15 @@ static void log_atfork_child(void)
 	pthread_mutex_unlock(&dnsmasq_log.lock);
 }
 
-// Return 1 if this fd is associated with any logfile to avoid
-// dnsmasq closing it during initialization
+// Return 1 if this fd is associated with any logfile or the journald socket
+// to avoid dnsmasq closing it during initialization
 int __attribute__((pure)) is_log_fd(const int fd)
 {
+#ifdef HAVE_LIBJOURNAL
+	return fd == ftl_log.fd || fd == webserver_log.fd || fd == dnsmasq_log.fd || fd == journal_get_fd();
+#else
 	return fd == ftl_log.fd || fd == webserver_log.fd || fd == dnsmasq_log.fd;
+#endif
 }
 
 // Reopen the log if requested.  Must be called with log->lock held.
@@ -165,6 +173,21 @@ static void set_log_path(struct log_fd *log, const char *path)
 // open_log_fds(false): open webserver.log + pihole.log (called after config)
 void open_log_fds(bool ftl)
 {
+#ifdef HAVE_LIBJOURNAL
+	// Initialize journal if configured
+	if(ftl && config.files.log.destination.v.log_destination == LOG_DEST_JOURNAL)
+	{
+		const int rc = journal_init();
+		if(rc < 0)
+		{
+			fprintf(stderr,
+			        "pihole-FTL: Cannot connect to systemd-journald: %s\n",
+			        strerror(-rc));
+			exit(EXIT_FAILURE);
+		}
+	}
+#endif
+
 	// Only open log files when file logging is explicitly selected
 	if(config.files.log.destination.v.log_destination != LOG_DEST_FILE)
 		return;
@@ -602,8 +625,14 @@ void __attribute__ ((format (printf, 3, 4))) _FTL_log(const int priority, const 
 	const char *prio = priostr(priority, flag);
 
 	// Print to stdout before writing to file
-	// Skip human-readable output when structured logging (JSON) is active
-	if((!daemonmode || cli_mode) && print_stdout && config.files.log.destination.v.log_destination != LOG_DEST_JSON)
+	// Skip human-readable output when structured logging (JSON or journal) is active
+	if((!daemonmode || cli_mode) && print_stdout &&
+	   config.files.log.destination.v.log_destination != LOG_DEST_JSON &&
+#ifdef HAVE_LIBJOURNAL
+	   config.files.log.destination.v.log_destination != LOG_DEST_JOURNAL)
+#else
+	   true)
+#endif
 	{
 		// Only print time/ID string when not in direct user interaction (CLI mode)
 		if(!cli_mode)
@@ -634,6 +663,24 @@ void __attribute__ ((format (printf, 3, 4))) _FTL_log(const int priority, const 
 
 			write_json_log(now, prio, "FTL", json_buffer);
 		}
+
+		// Route to journald output
+#ifdef HAVE_LIBJOURNAL
+		if(config.files.log.destination.v.log_destination == LOG_DEST_JOURNAL)
+		{
+			char journal_buffer[8192];
+			va_start(args, format);
+			vsnprintf(journal_buffer, sizeof(journal_buffer), format, args);
+			va_end(args);
+
+			journal_send("MESSAGE=%s", journal_buffer,
+			             "PRIORITY=%d", priority,
+			             "DEBUG_FLAG=%s", debugstr(flag),
+			             "COMPONENT=%s", "FTL",
+			             "SYSLOG_IDENTIFIER=pihole-FTL",
+			             NULL);
+		}
+#endif
 
 		// Write to log file only when file logging is explicitly selected
 		if(config.files.log.destination.v.log_destination == LOG_DEST_FILE)
@@ -708,8 +755,26 @@ void __attribute__ ((format (printf, 3, 4))) _log_web(const int priority, const 
 		printf("\n");
 	}
 
-	// Print to log file or FIFO
-	if(print_log)
+	// Route to journald output
+#ifdef HAVE_LIBJOURNAL
+	if(config.files.log.destination.v.log_destination == LOG_DEST_JOURNAL)
+	{
+		char journal_buffer[8192];
+		va_start(args, format);
+		vsnprintf(journal_buffer, sizeof(journal_buffer), format, args);
+		va_end(args);
+
+		journal_send("MESSAGE=%s", journal_buffer,
+		             "PRIORITY=%d", priority,
+		             "DEBUG_FLAG=%s", debugstr(flag),
+		             "COMPONENT=%s", "webserver",
+		             "SYSLOG_IDENTIFIER=pihole-FTL",
+		             NULL);
+	}
+#endif
+
+	// Write to log file only when file logging is explicitly selected
+	if(config.files.log.destination.v.log_destination == LOG_DEST_FILE)
 	{
 		// Add line to FIFO buffer
 		char buffer[MAX_MSG_FIFO + 1u];
