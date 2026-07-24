@@ -28,7 +28,7 @@
 #include "database/query-table.h"
 // runGC()
 #include "gc.h"
-// open(), O_WRONLY, O_CREAT, O_APPEND
+// open(), O_WRONLY, O_CREAT, O_APPEND, O_CLOEXEC
 #include <fcntl.h>
 
 static bool print_log = true, print_stdout = true;
@@ -67,7 +67,7 @@ static bool write_log_line(struct log_fd *log, const char *line, size_t len)
 	{
 		log->reopen_needed = 0;
 		close(log->fd);
-		log->fd = open(log->path, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP);
+		log->fd = open(log->path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 	}
 
 	ssize_t written = 0;
@@ -111,7 +111,7 @@ void open_log_fds(bool ftl)
 		if(config.files.log.ftl.v.s != NULL)
 		{
 			ftl_log.path = config.files.log.ftl.v.s;
-			ftl_log.fd = open(ftl_log.path, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP);
+			ftl_log.fd = open(ftl_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 			if(ftl_log.fd == -1)
 			{
 				printf("ERROR: Opening of FTL log (%s) failed: %s\nUsing syslog instead!\n",
@@ -126,14 +126,14 @@ void open_log_fds(bool ftl)
 	if(config.files.log.webserver.v.s != NULL)
 	{
 		webserver_log.path = config.files.log.webserver.v.s;
-		webserver_log.fd = open(webserver_log.path, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP);
+		webserver_log.fd = open(webserver_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 	}
 
 	// pihole.log (dnsmasq) — FTL owns this file from now on
 	if(config.files.log.dnsmasq.v.s != NULL)
 	{
 		dnsmasq_log.path = config.files.log.dnsmasq.v.s;
-		dnsmasq_log.fd = open(dnsmasq_log.path, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP);
+		dnsmasq_log.fd = open(dnsmasq_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 	}
 }
 
@@ -906,7 +906,7 @@ bool flush_dnsmasq_log(void)
 	pthread_mutex_lock(&dnsmasq_log.lock);
 	if(dnsmasq_log.fd != -1)
 		close(dnsmasq_log.fd);
-	dnsmasq_log.fd = open(dnsmasq_log.path, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP);
+	dnsmasq_log.fd = open(dnsmasq_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 	pthread_mutex_unlock(&dnsmasq_log.lock);
 
 	// Flush dnsmasq FIFO logs
