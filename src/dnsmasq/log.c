@@ -329,19 +329,6 @@ void my_syslog(int priority, const char *format, ...)
   va_end(ap);
   FTL_dnsmasq_log(buffer, priority, func, len > MAX_MESSAGE ? MAX_MESSAGE : len);
 
-  /* Pi-hole diagnosis system */
-  if(priority == LOG_WARNING)
-    {
-      char *message;
-      va_start(ap, format);
-      if(vasprintf(&message, format, ap))
-        {
-          dnsmasq_diagnosis_warning(message);
-          free(message);
-        }
-      va_end(ap);
-    }
-
   /* Pi-hole: FTL owns pihole.log.  Bypass dnsmasq's file-write path
      and syslog fallback entirely. */
   return;
