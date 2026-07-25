@@ -335,7 +335,7 @@ const char *debugstr(const enum debug_flag flag)
 // Write a dnsmasq log line to pihole.log in dnsmasq's exact on-disk format.
 // The message is the bare body (no timestamp, no prefix) as handed to
 // FTL_dnsmasq_log() from my_syslog().  We reproduce dnsmasq's format:
-//   "Mon Jan  1 12:00:00 2024 dnsmasq-dhcp[12345]: <message>\n"
+//   "Jan  1 12:00:00 dnsmasq-dhcp[12345]: <message>\n"
 // where the func suffix (e.g. "-dhcp", "-tftp") comes from the priority
 // bits extracted in my_syslog().
 void FTL_write_dnsmasq_log(const char *message, const char *func)
@@ -343,11 +343,14 @@ void FTL_write_dnsmasq_log(const char *message, const char *func)
 	if(dnsmasq_log.fd == -1)
 		return;
 
+	struct tm tm;
 	time_t now = time(NULL);
-	char *ts = ctime(&now);
+	localtime_r(&now, &tm);
+	char ts_buf[16];
+	strftime(ts_buf, sizeof(ts_buf), "%b %e %H:%M:%S", &tm);
 
 	char line[2048];
-	int off = snprintf(line, sizeof(line), "%.20s dnsmasq%s[%d]: ", ts + 4, func ? func : "", getpid());
+	int off = snprintf(line, sizeof(line), "%s dnsmasq%s[%d]: ", ts_buf, func ? func : "", getpid());
 
 	const char *msg = message ? message : "";
 	off += snprintf(line + off, sizeof(line) - off, "%s", msg);
