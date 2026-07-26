@@ -4344,6 +4344,7 @@ void FTL_dnsmasq_log(const char *payload, const int priority, const char *func, 
 		             "PRIORITY=%d", priority,
 		             "COMPONENT=%s", "dnsmasq",
 		             "SYSLOG_IDENTIFIER=pihole-FTL",
+		             "TID=%d", gettid(),
 		             NULL);
 	}
 #endif
