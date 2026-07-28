@@ -330,12 +330,10 @@ void my_syslog(int priority, const char *format, ...)
   FTL_dnsmasq_log(buffer, priority, func, len > MAX_MESSAGE ? MAX_MESSAGE : len);
 
   /* Pi-hole: FTL owns pihole.log.  Bypass dnsmasq's file-write path
-     and syslog fallback entirely. */
-  return;
-  /*******************************************************************************/
-
-
-  if (echo_stderr) 
+     and syslog fallback entirely.
+     Keep echo_stderr so dnsmasq --test errors reach stderr (captured
+     by test_dnsmasq_config() in src/config/dnsmasq_config.c). */
+  if (echo_stderr)
     {
       fprintf(stderr, "dnsmasq%s: ", func);
       va_start(ap, format);
@@ -343,6 +341,9 @@ void my_syslog(int priority, const char *format, ...)
       va_end(ap);
       fputc('\n', stderr);
     }
+
+  return;
+  /*******************************************************************************/
 
   if (log_fd == -1)
     {
