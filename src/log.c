@@ -127,6 +127,11 @@ void open_log_fds(bool ftl)
 	{
 		webserver_log.path = config.files.log.webserver.v.s;
 		webserver_log.fd = open(webserver_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
+		if(webserver_log.fd == -1)
+		{
+			log_warn("webserver.log is unavailable (%s); warnings are still relayed to the FTL log",
+			         strerror(errno));
+		}
 	}
 
 	// pihole.log (dnsmasq) — FTL owns this file from now on
@@ -482,7 +487,7 @@ void __attribute__ ((format (printf, 3, 4))) _log_web(const int priority, const 
 
 		line[off++] = '\n';
 
-		if(!write_log_line(&webserver_log, line, off) && config.files.log.webserver.v.s != NULL && !daemonmode)
+		if(!write_log_line(&webserver_log, line, off) && priority <= LOG_WARNING)
 		{
 			// No web log available - keep severe messages durable
 			_FTL_log(priority, flag, "%s", buffer);
