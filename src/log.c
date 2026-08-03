@@ -46,6 +46,29 @@ static struct log_fd ftl_log = { .fd = -1, .lock = PTHREAD_MUTEX_INITIALIZER };
 static struct log_fd webserver_log = { .fd = -1, .lock = PTHREAD_MUTEX_INITIALIZER };
 static struct log_fd dnsmasq_log = { .fd = -1, .lock = PTHREAD_MUTEX_INITIALIZER };
 
+// dnsmasq forks per TCP query while FTL threads may be mid-write.  Without
+// atfork handling the child would inherit one of the per-file mutexes locked
+// and the first my_syslog() there would block forever, hanging that query.
+// Lock all log mutexes before fork() and release them in both parent and child.
+static void log_atfork_prepare(void)
+{
+	pthread_mutex_lock(&ftl_log.lock);
+	pthread_mutex_lock(&webserver_log.lock);
+	pthread_mutex_lock(&dnsmasq_log.lock);
+}
+static void log_atfork_parent(void)
+{
+	pthread_mutex_unlock(&ftl_log.lock);
+	pthread_mutex_unlock(&webserver_log.lock);
+	pthread_mutex_unlock(&dnsmasq_log.lock);
+}
+static void log_atfork_child(void)
+{
+	pthread_mutex_unlock(&ftl_log.lock);
+	pthread_mutex_unlock(&webserver_log.lock);
+	pthread_mutex_unlock(&dnsmasq_log.lock);
+}
+
 // Return 1 if this fd is associated with any logfile to avoid
 // dnsmasq closing it during initialization
 int __attribute__((pure)) is_log_fd(const int fd)
@@ -158,6 +181,15 @@ void open_log_fds(bool ftl)
 			log_warn("pihole.log is unavailable (%s); dnsmasq warnings are still relayed to the FTL log",
 			         strerror(errno));
 		}
+	}
+
+	// Register atfork handlers once, before any threads or dnsmasq forks
+	// exist, so a TCP-query fork can never inherit a locked log mutex
+	static bool atfork_registered = false;
+	if(!atfork_registered)
+	{
+		atfork_registered = true;
+		pthread_atfork(log_atfork_prepare, log_atfork_parent, log_atfork_child);
 	}
 }
 
