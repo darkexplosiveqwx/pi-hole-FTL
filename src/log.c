@@ -408,6 +408,11 @@ void FTL_write_dnsmasq_log(const char *message, const char *func)
 	char line[2048];
 	int off = snprintf(line, sizeof(line), "%s dnsmasq%s[%d]: ", ts_buf, func ? func : "", getpid());
 
+	// Clamp before using off as an offset - snprintf returns the would-be
+	// length on truncation and sizeof(line) - off would underflow otherwise
+	if(off >= (int)sizeof(line))
+		off = sizeof(line) - 1;
+
 	const char *msg = message ? message : "";
 	off += snprintf(line + off, sizeof(line) - off, "%s", msg);
 
@@ -464,6 +469,12 @@ void __attribute__ ((format (printf, 3, 4))) _FTL_log(const int priority, const 
 		// Format full line and write to cached fd
 		char line[2048];
 		int off = snprintf(line, sizeof(line), "%s [%s] %s: ", timestring, idstr, prio);
+
+		// Clamp before using off as an offset - snprintf returns the would-be
+		// length on truncation and sizeof(line) - off would underflow otherwise
+		if(off >= (int)sizeof(line))
+			off = sizeof(line) - 1;
+
 		va_start(args, format);
 		off += vsnprintf(line + off, sizeof(line) - off, format, args);
 		va_end(args);
@@ -528,6 +539,12 @@ void __attribute__ ((format (printf, 3, 4))) _log_web(const int priority, const 
 		// Format full line and write to cached fd
 		char line[2048];
 		int off = snprintf(line, sizeof(line), "%s [%s] %s: ", timestring, idstr, prio);
+
+		// Clamp before using off as an offset - snprintf returns the would-be
+		// length on truncation and sizeof(line) - off would underflow otherwise
+		if(off >= (int)sizeof(line))
+			off = sizeof(line) - 1;
+
 		va_start(args, format);
 		off += vsnprintf(line + off, sizeof(line) - off, format, args);
 		va_end(args);
