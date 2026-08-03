@@ -359,11 +359,14 @@ const char *debugstr(const enum debug_flag flag)
 // bits extracted in my_syslog().
 void FTL_write_dnsmasq_log(const char *message, const char *func)
 {
-	struct tm tm;
+	// Locale-independent timestamp: ctime() renders the month/day in the
+	// C locale regardless of setlocale(LC_ALL, ""), so the buffer cannot
+	// overflow with non-English month names (strftime("%b") would emit
+	// e.g. six bytes for ru_RU). This is dnsmasq's own idiom and keeps
+	// the on-disk format byte-identical to what we wrote before.
 	time_t now = time(NULL);
-	localtime_r(&now, &tm);
 	char ts_buf[16];
-	strftime(ts_buf, sizeof(ts_buf), "%b %e %H:%M:%S", &tm);
+	snprintf(ts_buf, sizeof(ts_buf), "%.15s", ctime(&now) + 4);
 
 	char line[2048];
 	int off = snprintf(line, sizeof(line), "%s dnsmasq%s[%d]: ", ts_buf, func ? func : "", getpid());
