@@ -178,8 +178,14 @@ void open_log_fds(bool ftl)
 		dnsmasq_log.fd = open(dnsmasq_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 		if(dnsmasq_log.fd == -1)
 		{
-			log_warn("pihole.log is unavailable (%s); dnsmasq warnings are still relayed to the FTL log",
-			         strerror(errno));
+			// Warn regardless - the hide_dnsmasq_warn setting only controls
+			// whether the warnings themselves are shown, not this notice
+			if(config.misc.hide_dnsmasq_warn.v.b)
+				log_warn("pihole.log is unavailable (%s); dnsmasq warnings are hidden (misc.hide_dnsmasq_warn)",
+				         strerror(errno));
+			else
+				log_warn("pihole.log is unavailable (%s); dnsmasq warnings are still relayed to the FTL log",
+				         strerror(errno));
 		}
 	}
 
