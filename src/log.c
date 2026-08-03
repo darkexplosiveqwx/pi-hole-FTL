@@ -144,7 +144,7 @@ void open_log_fds(bool ftl)
 {
 	if(ftl)
 	{
-		// FTL.log — path is known from getLogFilePath()
+		// FTL.log - path is known from getLogFilePath()
 		if(config.files.log.ftl.v.s != NULL)
 		{
 			ftl_log.path = config.files.log.ftl.v.s;
@@ -159,7 +159,7 @@ void open_log_fds(bool ftl)
 		return;
 	}
 
-	// webserver.log + pihole.log — paths are known after readFTLconf()
+	// webserver.log + pihole.log - paths are known after readFTLconf()
 	if(config.files.log.webserver.v.s != NULL)
 	{
 		webserver_log.path = config.files.log.webserver.v.s;
@@ -171,7 +171,7 @@ void open_log_fds(bool ftl)
 		}
 	}
 
-	// pihole.log (dnsmasq) — FTL owns this file from now on
+	// pihole.log (dnsmasq) - FTL owns this file from now on
 	if(config.files.log.dnsmasq.v.s != NULL)
 	{
 		dnsmasq_log.path = config.files.log.dnsmasq.v.s;
@@ -411,7 +411,7 @@ void FTL_write_dnsmasq_log(const char *message, const char *func)
 	const char *msg = message ? message : "";
 	off += snprintf(line + off, sizeof(line) - off, "%s", msg);
 
-	// Clamp to buffer end — snprintf returns would-be length on truncation
+	// Clamp to buffer end - snprintf returns would-be length on truncation
 	if(off >= (int)sizeof(line))
 		off = sizeof(line) - 1;
 
@@ -468,7 +468,7 @@ void __attribute__ ((format (printf, 3, 4))) _FTL_log(const int priority, const 
 		off += vsnprintf(line + off, sizeof(line) - off, format, args);
 		va_end(args);
 
-		// Clamp to buffer end — snprintf returns would-be length on truncation
+		// Clamp to buffer end - snprintf returns would-be length on truncation
 		if(off >= (int)sizeof(line))
 			off = sizeof(line) - 1;
 
@@ -532,7 +532,7 @@ void __attribute__ ((format (printf, 3, 4))) _log_web(const int priority, const 
 		off += vsnprintf(line + off, sizeof(line) - off, format, args);
 		va_end(args);
 
-		// Clamp to buffer end — snprintf returns would-be length on truncation
+		// Clamp to buffer end - snprintf returns would-be length on truncation
 		if(off >= (int)sizeof(line))
 			off = sizeof(line) - 1;
 

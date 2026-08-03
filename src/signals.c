@@ -1415,7 +1415,7 @@ void handle_signals(void)
 
 // SIGUSR2: reopen all log fds (logrotate).
 // Registered after dnsmasq so it replaces dnsmasq's handler for this
-// signal — FTL owns all on-disk logs now.
+// signal - FTL owns all on-disk logs now.
 static void SIGUSR2_handler(int signum, siginfo_t *si, void *context)
 {
 	(void)signum; (void)si; (void)context;
