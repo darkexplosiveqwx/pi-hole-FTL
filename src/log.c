@@ -58,16 +58,30 @@ int __attribute__((pure)) is_log_fd(const int fd)
 // per-file so SIGUSR2 only touches the fd that actually needs it.
 static bool write_log_line(struct log_fd *log, const char *line, size_t len)
 {
-	if(log->fd == -1)
+	// Do not try to write when the path is unknown
+	if(log->path == NULL)
 		return false;
 
+	// log->fd and log->reopen_needed are only accessed under the lock so a
+	// reopen (e.g. from flush_dnsmasq_log()) can never race a concurrent write
 	pthread_mutex_lock(&log->lock);
 
+	// Reopen the log if requested.  This must be tested before the fd == -1
+	// check so that SIGUSR2 can revive a log whose initial open failed (missing
+	// directory, transient EACCES, ...).
 	if(log->reopen_needed)
 	{
 		log->reopen_needed = 0;
-		close(log->fd);
+		if(log->fd != -1)
+			close(log->fd);
 		log->fd = open(log->path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
+	}
+
+	// No usable descriptor: let the caller fall back to another channel
+	if(log->fd == -1)
+	{
+		pthread_mutex_unlock(&log->lock);
+		return false;
 	}
 
 	ssize_t written = 0;
@@ -345,9 +359,6 @@ const char *debugstr(const enum debug_flag flag)
 // bits extracted in my_syslog().
 void FTL_write_dnsmasq_log(const char *message, const char *func)
 {
-	if(dnsmasq_log.fd == -1)
-		return;
-
 	struct tm tm;
 	time_t now = time(NULL);
 	localtime_r(&now, &tm);
