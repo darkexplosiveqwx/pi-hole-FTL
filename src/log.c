@@ -70,9 +70,8 @@ static void log_atfork_child(void)
 }
 
 // Return 1 if this fd is associated with any logfile to avoid
-// dnsmasq closing it during initialization.
-// Not marked pure: the descriptors are reassigned on reopen from another thread.
-int is_log_fd(const int fd)
+// dnsmasq closing it during initialization
+int __attribute__((pure)) is_log_fd(const int fd)
 {
 	return fd == ftl_log.fd || fd == webserver_log.fd || fd == dnsmasq_log.fd;
 }
@@ -428,7 +427,7 @@ bool FTL_write_dnsmasq_log(const char *message, const char *func)
 	// format byte-identical to what we wrote before.
 	time_t now = time(NULL);
 	char ctime_buf[26];
-	char *ctime_str = ctime_r(&now, ctime_buf);
+	const char *ctime_str = ctime_r(&now, ctime_buf);
 	if(ctime_str == NULL)
 		ctime_str = "Jan  1 00:00:00 ";
 	char ts_buf[16];
