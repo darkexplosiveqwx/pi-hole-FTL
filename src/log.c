@@ -175,6 +175,8 @@ void open_log_fds(bool ftl)
 	if(config.files.log.webserver.v.s != NULL)
 	{
 		set_log_path(&webserver_log, config.files.log.webserver.v.s);
+		if(webserver_log.fd >= 0)
+			close(webserver_log.fd);
 		webserver_log.fd = open(webserver_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 		if(webserver_log.fd == -1)
 		{
@@ -187,6 +189,8 @@ void open_log_fds(bool ftl)
 	if(config.files.log.dnsmasq.v.s != NULL)
 	{
 		set_log_path(&dnsmasq_log, config.files.log.dnsmasq.v.s);
+		if(dnsmasq_log.fd >= 0)
+			close(dnsmasq_log.fd);
 		dnsmasq_log.fd = open(dnsmasq_log.path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR|S_IRGRP);
 		if(dnsmasq_log.fd == -1)
 		{
