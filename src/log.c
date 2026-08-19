@@ -144,7 +144,8 @@ static void set_log_path(struct log_fd *log, const char *path)
 {
 	if(log->path != NULL && path != NULL && strcmp(log->path, path) == 0)
 		return; // unchanged
-	free(log->path);
+	if(log->path != NULL)
+		free(log->path);
 	log->path = path != NULL ? strdup(path) : NULL;
 }
 
