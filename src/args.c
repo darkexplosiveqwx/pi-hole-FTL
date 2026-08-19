@@ -691,7 +691,7 @@ void parse_args(int argc, char *argv[])
 		}
 
 		// Build iovec array for journal_sendv()
-		// Each field must be in "KEY=value\n" format per the journald wire protocol
+		// Each field must be in "KEY=value" format; journal_sendv() adds newlines
 		const int nfields = (argc - 2) + (stdin_message != NULL ? 1 : 0);
 		struct iovec *iov = malloc(nfields * sizeof(struct iovec));
 		if(iov == NULL)
@@ -704,16 +704,15 @@ void parse_args(int argc, char *argv[])
 		{
 			const char *arg = argv[i];
 			const size_t len = strlen(arg);
-			char *field = malloc(len + 1);
+			char *field = malloc(len);
 			if(field == NULL)
 			{
 				printf("Error: Memory allocation failed.\n");
 				exit(EXIT_FAILURE);
 			}
 			memcpy(field, arg, len);
-			field[len] = '\n';
 			iov[idx].iov_base = field;
-			iov[idx].iov_len = len + 1;
+			iov[idx].iov_len = len;
 			idx++;
 		}
 
@@ -722,7 +721,7 @@ void parse_args(int argc, char *argv[])
 		{
 			const size_t msg_len = strlen(stdin_message);
 			const size_t field_len = 8 + msg_len; // "MESSAGE=" + content
-			char *field = malloc(field_len + 1);
+			char *field = malloc(field_len);
 			if(field == NULL)
 			{
 				printf("Error: Memory allocation failed.\n");
@@ -730,9 +729,8 @@ void parse_args(int argc, char *argv[])
 			}
 			memcpy(field, "MESSAGE=", 8);
 			memcpy(field + 8, stdin_message, msg_len);
-			field[field_len] = '\n';
 			iov[idx].iov_base = field;
-			iov[idx].iov_len = field_len + 1;
+			iov[idx].iov_len = field_len;
 			free(stdin_message);
 		}
 
