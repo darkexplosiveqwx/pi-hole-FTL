@@ -434,7 +434,7 @@ bool FTL_write_dnsmasq_log(const char *message, const char *func)
 	char ctime_buf[26];
 	const char *ctime_str = ctime_r(&now, ctime_buf);
 	if(ctime_str == NULL)
-		ctime_str = "Jan  1 00:00:00 ";
+		ctime_str = "Thu Jan  1 00:00:00 1970\n";
 	char ts_buf[16];
 	snprintf(ts_buf, sizeof(ts_buf), "%.15s", ctime_str + 4);
 
