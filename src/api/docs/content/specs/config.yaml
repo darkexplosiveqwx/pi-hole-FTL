@@ -657,6 +657,11 @@ components:
                       type: string
                     webserver:
                       type: string
+                    destination:
+                      type: string
+                      enum:
+                        - "FILE"
+                        - "JSON"
             misc:
               type: object
               properties:
@@ -1093,6 +1098,7 @@ components:
               ftl: "/var/log/pihole/FTL.log"
               dnsmasq: "/var/log/pihole/pihole.log"
               webserver: "/var/log/pihole/webserver.log"
+              destination: "FILE"
           misc:
             nice: -10
             delay_startup: 10
