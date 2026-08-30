@@ -33,6 +33,7 @@
 #include "files.h"
 // add_to_fifo_buffer() u.a.
 #include "log.h"
+#include "logger.h"
 #ifdef HAVE_LIBJOURNAL
 // journal_send()
 #include <journal.h>
@@ -3623,7 +3624,21 @@ void FTL_fork_and_bind_sockets(struct passwd *ent_pw, bool dnsmasq_start)
 	// is asked to stay in foreground, we just save
 	// the PID of the current process in the PID file
 	if(daemonmode)
+	{
+		// Double fork into the daemon.  This must happen without the logger
+		// thread being touched: go_daemon() itself only forks and is
+		// thread-safe, so the pre-fork logger thread keeps draining the
+		// shared-memory ring until the (short-lived) fork generations exit.
 		go_daemon();
+
+		// The grandchild has NO logger thread: fork() only retains the
+		// calling thread, so the pre-fork consumer is gone with the parent
+		// process.  Restart the consumer in this process on the inherited
+		// ring/eventfd - without doing so, everything logged after the fork
+		// (blocking status, regex compilation, alias-client imports, ...)
+		// would silently vanish from the log files.
+		logger_start_after_daemonize();
+	}
 
 	// Initialize query database (pihole-FTL.db)
 	db_init();
@@ -4244,49 +4259,39 @@ static void _query_set_dnssec(queriesData *query, const enum dnssec_status dnsse
 // Add dnsmasq log line to internal FIFO buffer (can be queried via the API)
 void FTL_dnsmasq_log(const char *payload, const int priority, const char *func, const int length)
 {
-	// dnsmasq has no FTL debug flags, so its LOG_DEBUG is a plain "DEBUG"
-	// rather than the DEBUG_ANY catch-all priostr() maps to
-	const char *prio = priority == LOG_DEBUG ? "DEBUG" : priostr(priority, DEBUG_NONE);
+	// Build a canonical log record and enqueue it.  The logger thread renders
+	// all sinks (pihole.log, FIFO, JSON, journal), so this producer is
+	// lock-free and runs identically in the main process and in the dnsmasq
+	// TCP-query fork children (which relay their records here).
+	struct log_record rec;
+	log_record_init(&rec, LOG_SOURCE_DNSMASQ, priority, DEBUG_NONE);
 
-	// Lock SHM
-	lock_shm();
-
-	// Add to FIFO buffer
-	add_to_fifo_buffer(FIFO_DNSMASQ, payload, prio, length);
-
-	// Unlock SHM
-	unlock_shm();
-
-	// Route to JSON output
-	if(config.files.log.destination.v.log_destination == LOG_DEST_JSON && !daemonmode)
+	// Copy the function suffix that dnsmasq embeds in its syslog format
+	// ("dnsmasq-dhcp", "dnsmasq-tftp", ...); the payload follows it.
+	if(func != NULL)
 	{
-		char idstr[42];
-		get_idstr(idstr, sizeof(idstr));
-
-		write_json_log(time(NULL), prio, "dnsmasq", idstr, payload);
+		const size_t funclen = strlen(func);
+		if(funclen < sizeof(rec.func))
+		{
+			memcpy(rec.func, func, funclen);
+			rec.func[funclen] = '\0';
+		}
 	}
 
-	// Route to journald output
-#ifdef HAVE_LIBJOURNAL
-	if(config.files.log.destination.v.log_destination == LOG_DEST_JOURNAL)
+	// Copy the dnsmasq payload into the record.  length includes the NUL
+	// terminator (my_syslog() passes MAX_MESSAGE on overflow), so only copy
+	// the string itself - rendering stops at the first NUL just like the
+	// previous snprintf("%s", ...) path.
+	if(length > 0)
 	{
-		journal_send("MESSAGE=%s", payload,
-		             "PRIORITY=%d", priority,
-		             "COMPONENT=%s", "dnsmasq",
-		             "SYSLOG_IDENTIFIER=pihole-FTL",
-		             "TID=%d", gettid(),
-		             NULL);
+		const size_t msglen = (size_t)strnlen(payload, (size_t)length);
+		const size_t copybytes = msglen < sizeof(rec.message) ? msglen : sizeof(rec.message) - 1u;
+		memcpy(rec.message, payload, copybytes);
+		rec.len = copybytes;
+		rec.message[LOGGER_MAX_MESSAGE - 1u] = '\0';
 	}
-#endif
 
-	// Write to pihole.log via shared writer (FTL owns this file now).
-	// If pihole.log is unavailable, fall back to syslog for warnings and
-	// errors so they are not silently lost for the lifetime of the process.
-	if(config.files.log.destination.v.log_destination == LOG_DEST_FILE)
-	{
-		if(!FTL_write_dnsmasq_log(payload, func) && priority <= LOG_WARNING)
-			syslog(priority, "%s", payload);
-	}
+	log_ring_push(&rec);
 
 	/* Pi-hole diagnosis system */
 	if(priority == LOG_WARNING)
