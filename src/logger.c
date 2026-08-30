@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 
@@ -122,6 +123,8 @@ static int flush_trunc_err = 0;
 typedef struct {
 	char path[LOGGER_MAX_PATH];  // owned by the logger thread
 	int fd;                      // -1 when closed/unavailable
+	dev_t dev;                   // identity of the file fd was opened on,
+	ino_t ino;                   // for the stale-descriptor guard in sink_close()
 } loggerSink;
 
 static loggerSink sink_ftl = { .path = { 0 }, .fd = -1 };
@@ -534,11 +537,25 @@ static bool sink_write(loggerSink *sink, const char *buf, const size_t len)
 
 static void sink_close(loggerSink *sink)
 {
-	if(sink->fd >= 0)
+	if(sink->fd < 0)
+		return;
+
+	// Stale-descriptor guard: across fork() (daemon mode) the pre-fork logger
+	// thread may have been frozen between its sink_close() and the matching
+	// reopen, leaving this process with a sink fd number that is no longer
+	// occupied by the sink file.  Closing such a recycled descriptor here
+	// would destroy whatever the number was reused for (e.g. a freshly bound
+	// dnsmasq DNS listener socket) and silently kill that listener.  Only
+	// close the descriptor when it still refers to the file opened for the
+	// sink; otherwise just drop the stale number.
+	struct stat st;
+	if(fstat(sink->fd, &st) != 0 || st.st_dev != sink->dev || st.st_ino != sink->ino)
 	{
-		close(sink->fd);
 		sink->fd = -1;
+		return;
 	}
+	close(sink->fd);
+	sink->fd = -1;
 }
 
 static void sink_store_path(loggerSink *sink, const char *path)
@@ -562,6 +579,7 @@ static void sink_store_path(loggerSink *sink, const char *path)
 // SIGUSR2 can revive a sink that failed initially (missing directory, EACCES).
 static void sink_open(loggerSink *sink, const bool is_ftl)
 {
+	struct stat st;
 	sink_close(sink);
 	if(sink->path[0] == '\0')
 		return;
@@ -575,6 +593,15 @@ static void sink_open(loggerSink *sink, const bool is_ftl)
 		        "ERROR: Opening of FTL log (%s) failed: %s\nUsing syslog instead!\n",
 		        sink->path, strerror(errno));
 		syslog(LOG_ERR, "Opening of FTL's log file failed, using syslog instead!");
+		return;
+	}
+
+	// Remember the identity of the file we opened so sink_close() can detect
+	// a descriptor that was recycled (see the guard there).
+	if(fstat(sink->fd, &st) == 0)
+	{
+		sink->dev = st.st_dev;
+		sink->ino = st.st_ino;
 	}
 }
 
