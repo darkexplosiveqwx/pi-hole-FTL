@@ -686,10 +686,8 @@ void dnsmasq_diagnosis_warning(const char *message)
 	logg_warn_dnsmasq_message(skipStr("warning: ", message));
 }
 
-void add_to_fifo_buffer(const enum fifo_logs which, const char *payload, const char *prio, const size_t length)
+void add_to_fifo_buffer(const enum fifo_logs which, const char *payload, const char *prio, const size_t length, const double timestamp)
 {
-	const double now = double_time();
-
 	// Do not try to log when shared memory isn't initialized yet
 	if(!fifo_log)
 		return;
@@ -735,7 +733,7 @@ void add_to_fifo_buffer(const enum fifo_logs which, const char *payload, const c
 	}
 
 	// Set timestamp
-	fifo_log->logs[which].timestamp[idx] = now;
+	fifo_log->logs[which].timestamp[idx] = timestamp;
 
 	// Set prio (if available)
 	fifo_log->logs[which].prio[idx] = prio;
