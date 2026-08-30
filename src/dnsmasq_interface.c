@@ -4288,7 +4288,9 @@ void FTL_dnsmasq_log(const char *payload, const int priority, const char *func, 
 		const size_t copybytes = msglen < sizeof(rec.message) ? msglen : sizeof(rec.message) - 1u;
 		memcpy(rec.message, payload, copybytes);
 		rec.len = copybytes;
-		rec.message[LOGGER_MAX_MESSAGE - 1u] = '\0';
+		// Terminate at the end of the payload; copybytes is always less than
+		// sizeof(rec.message) so this is in-bounds.
+		rec.message[copybytes] = '\0';
 	}
 
 	log_ring_push(&rec);
