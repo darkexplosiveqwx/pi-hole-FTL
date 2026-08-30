@@ -74,8 +74,31 @@
 // The queue must work across a plain fork() (dnsmasq TCP children relay log
 // records to the main process).  That requires the _Atomic operations on the
 // counter/seq fields to be real instructions, not libc-internal locks.
+//
+// 64-bit counters cover i586+ (cmpxchg8b) and ARMv6K+ (ldrexd/strexd).  The
+// original Raspberry Pi 1 is ARMv6 non-K (ARM1176JZF-S): no ldrexd/strexd, so
+// ATOMIC_LLONG_LOCK_FREE is not 2 and 64-bit counters would fall back to
+// libc/libatomic locks.  For that target use 32-bit counters instead: they
+// ARE native LDREX/STREX instructions there, and the ring arithmetic is
+// correct modulo 2^32 because the producer-consumer distance never exceeds
+// LOGGER_RING_SLOTS << 2^32:
+//   - "tail - head" computed in 32 bits equals the true distance whenever that
+//     distance fits in 32 bits (it always does: the queue is bounded by
+//     LOGGER_RING_SLOTS), and
+//   - the per-slot seq markers only ever need to differ from the "consumed"
+//     and "published" values of the same slot, which are separated by a power
+//     of two (LOGGER_RING_SLOTS) and hence never collide modulo 2^32 - the
+//     same invariant the 64-bit counters rely on, just without the safety
+//     margin of an astronomically larger counter space.
+#if ATOMIC_LLONG_LOCK_FREE == 2
+typedef uint64_t log_ring_counter_t;
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                "the log ring requires lock-free 64-bit atomics");
+#else
+typedef uint32_t log_ring_counter_t;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "the log ring fallback needs lock-free 32-bit atomics");
+#endif
 
 // ---- Shared-memory ring ---------------------------------------------------
 // Layout shared verbatim with dnsmasq TCP-query forks, which both produce and
@@ -83,9 +106,9 @@ _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
 // padding surprises beyond normal alignment.
 
 typedef struct {
-	_Atomic uint64_t head;                          // next counter value to consume
-	_Atomic uint64_t tail;                          // next counter value to claim
-	_Atomic uint64_t seq[LOGGER_RING_SLOTS];        // per-slot generation markers
+	_Atomic log_ring_counter_t head;                // next counter value to consume
+	_Atomic log_ring_counter_t tail;                // next counter value to claim
+	_Atomic log_ring_counter_t seq[LOGGER_RING_SLOTS]; // per-slot generation markers
 	struct log_record slot[LOGGER_RING_SLOTS];      // the records themselves
 } logRing;
 
@@ -159,19 +182,19 @@ static void logger_wake(void);
 static void publish_sink_fds(void);
 
 // ---- Ring queue (Vyukov bounded MPMC with per-slot seq markers) -------------
-static bool log_ring_enqueue(struct log_record *rec, uint64_t *claimed)
+static bool log_ring_enqueue(struct log_record *rec, log_ring_counter_t *claimed)
 {
 	logRing *r = ring;
 	if (r == NULL)
 		return false;
 
-	uint64_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+	log_ring_counter_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
 	for (;;)
 	{
 		// The queue is full once the distance tail-head reaches the capacity.
 		// head only ever increases, so a tail validated here can never be
 		// written over a slot the consumer has not yet consumed.
-		const uint64_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+		const log_ring_counter_t head = atomic_load_explicit(&r->head, memory_order_acquire);
 		if (tail - head >= LOGGER_RING_SLOTS)
 			return false;
 
@@ -182,7 +205,7 @@ static bool log_ring_enqueue(struct log_record *rec, uint64_t *claimed)
 		// tail was updated by the failed CAS; re-check capacity and retry
 	}
 
-	const uint64_t slot = tail % LOGGER_RING_SLOTS;
+	const log_ring_counter_t slot = tail % LOGGER_RING_SLOTS;
 	r->slot[slot] = *rec;  // contains no pointers; plain POD copy
 	// Publish with a release store: the consumer observes the record's data
 	// (via the copying read) only after seeing this marker.
@@ -197,14 +220,14 @@ static bool log_ring_pop(struct log_record *rec)
 	if (r == NULL)
 		return false;
 
-	uint64_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+	log_ring_counter_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
 	for (;;)
 	{
-		const uint64_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+		const log_ring_counter_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
 		if (head >= tail)
 			return false;  // empty
 
-		const uint64_t slot = head % LOGGER_RING_SLOTS;
+		const log_ring_counter_t slot = head % LOGGER_RING_SLOTS;
 		// Head-of-line slot not yet published: its producer is still copying
 		// the record.  Report empty; the caller will retry shortly.  This lets
 		// the consumer safely wait out out-of-order producers.
@@ -333,7 +356,7 @@ static bool try_enqueue(struct log_record *rec)
 	                                 rec->priority <= LOG_WARNING  ? 100u  : 0u;
 
 	unsigned int retries = 0;
-	uint64_t claimed;
+	log_ring_counter_t claimed;
 	for (;;)
 	{
 		if (log_ring_enqueue(rec, &claimed))
