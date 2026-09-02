@@ -646,6 +646,8 @@ static int binbuf_to_escaped_C_literal(const char *src_buf, size_t src_sz,
 // Escape a string with C style escape sequences
 char * __attribute__ ((malloc)) escape_string(const char *input)
 {
+	if(input == NULL)
+		return strdup("");
 	const size_t inputlen = strlen(input);
 	if(inputlen == 0)
 		return strdup("");

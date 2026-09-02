@@ -25,7 +25,7 @@ target_compile_options(civetweb PRIVATE -Wno-unused-but-set-variable -Wno-unused
 #          so civetweb's whole SSL layer is dead code and compiled out.
 # USE_IPV6: add IPv6 support
 # USE_LUA: add Lua support
-# USE_STACK_SIZE: pin worker-thread stack to 1 MiB. Without it, threads inherit
+# USE_STACK_SIZE: pin worker-thread stack to 2 MiB. Without it, threads inherit
 #          the platform default (~8 MiB on glibc, but only ~128 KiB on musl/Alpine),
 #          which is too tight for Lua pages, the recursive config API and Teleporter I/O.
 # TIMER_RESOLUTION: set timer resolution to 1000ms (default is 10ms) in an attempt to reduce CPU load
@@ -34,7 +34,7 @@ target_compile_definitions(civetweb PRIVATE NO_CGI
                                             NO_SSL
                                             USE_IPV6
                                             USE_LUA
-                                            USE_STACK_SIZE=1048576
+                                            USE_STACK_SIZE=2097152
                                             TIMER_RESOLUTION=1000)
 
 include_directories(${PROJECT_SOURCE_DIR}/src/lua)
