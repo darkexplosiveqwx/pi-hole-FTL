@@ -139,6 +139,11 @@ unsigned int get_year(const time_t timein)
 	return tm.tm_year + 1900;
 }
 
+bool __attribute__((pure)) FTL_want_stdout(void)
+{
+	return !daemonmode && config.files.log.destination.v.log_destination != LOG_DEST_JSON;
+}
+
 // ID string of the calling process/thread, e.g. "12345M" (main process),
 // "12345T2" (a thread of the main process) or "12345/F5678" (a fork child).
 // Used for the human-readable terminal output; the file sinks derive the same
