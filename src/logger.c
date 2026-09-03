@@ -181,7 +181,7 @@ static void *logger_thread_main(void *arg);
 static void logger_wake(void);
 static void publish_sink_fds(void);
 
-// ---- Ring queue (Vyukov bounded MPMC with per-slot seq markers) -------------
+// ---- Ring queue (Vyukov bounded MPSC with per-slot seq markers) -------------
 static bool log_ring_enqueue(struct log_record *rec, log_ring_counter_t *claimed)
 {
 	logRing *r = ring;
@@ -220,33 +220,28 @@ static bool log_ring_pop(struct log_record *rec)
 	if (r == NULL)
 		return false;
 
-	log_ring_counter_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
-	for (;;)
-	{
-		const log_ring_counter_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
-		if (head >= tail)
-			return false;  // empty
+	// Single consumer: no CAS needed on head.
+	const log_ring_counter_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+	const log_ring_counter_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+	if (head >= tail)
+		return false;  // empty
 
-		const log_ring_counter_t slot = head % LOGGER_RING_SLOTS;
-		// Head-of-line slot not yet published: its producer is still copying
-		// the record.  Report empty; the caller will retry shortly.  This lets
-		// the consumer safely wait out out-of-order producers.
-		if (atomic_load_explicit(&r->seq[slot], memory_order_acquire) != head + 1)
-			return false;
+	const log_ring_counter_t slot = head % LOGGER_RING_SLOTS;
+	// Head-of-line slot not yet published: its producer is still copying
+	// the record.  Report empty; the caller will retry shortly.  This lets
+	// the consumer safely wait out out-of-order producers.
+	if (atomic_load_explicit(&r->seq[slot], memory_order_acquire) != head + 1)
+		return false;
 
-		if (atomic_compare_exchange_weak_explicit(&r->head, &head, head + 1,
-		                                          memory_order_acquire,
-		                                          memory_order_relaxed))
-			break;
-		// head was updated by the failed CAS; re-check and retry
-	}
-
-	*rec = r->slot[head % LOGGER_RING_SLOTS];
+	*rec = r->slot[slot];
 	// Mark the slot consumed: the marker value now equals the counter a future
 	// producer will claim for this slot, which the head-of-line check above
 	// keeps distinct from the published (head+1) value.
-	atomic_store_explicit(&r->seq[head % LOGGER_RING_SLOTS],
+	atomic_store_explicit(&r->seq[slot],
 	                      head + LOGGER_RING_SLOTS, memory_order_release);
+	// Advance head after publishing seq so producers observe the correct slot
+	// availability on their next tail CAS.
+	atomic_store_explicit(&r->head, head + 1, memory_order_release);
 	return true;
 }
 
