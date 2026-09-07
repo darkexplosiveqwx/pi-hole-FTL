@@ -1343,7 +1343,7 @@ void parse_args(int argc, char *argv[])
 			printf("Version:         %s%s%s%s\n", green, bold, cJSON_Version(), normal);
 			printf("\n");
 #ifdef HAVE_LIBJOURNAL
-			printf("****************************** %s%slibjournal%s ********************************\n",
+			printf("****************************** %s%slibjournal%s ***************************\n",
 			       yellow, bold, normal);
 			printf("Version:         %s%s%s%s\n", green, bold, LIBJOURNAL_VERSION_STRING, normal);
 			printf("\n");
