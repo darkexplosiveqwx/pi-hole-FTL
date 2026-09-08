@@ -327,7 +327,7 @@ void log_record_init(struct log_record *rec, const enum log_source source,
 	// sink renders this value, so the timestamps in the log files are the
 	// exact production timestamps with millisecond precision - they are never
 	// re-sampled when the logger thread drains the record.
-	clock_gettime(CLOCK_REALTIME, &rec->ts);
+	rec->ts = double_time();
 	rec->priority = priority;
 	rec->flag = flag;
 	rec->source = source;
@@ -431,43 +431,17 @@ static const char *logger_prio(const struct log_record *rec)
 	return priostr(rec->priority, rec->flag);
 }
 
-// "YYYY-MM-DD HH:MM:SS.mmm TZ" in local time, byte-identical to the format
-// the previous get_timestr(timestring, rec->ts, true, false) produced -
-// except that the millisecond fraction is taken from the record's production
-// time instead of being re-sampled at drain time.
-static void logger_get_timestr_ms(char timestring[TIMESTR_SIZE],
-                                  const struct timespec *ts)
-{
-	struct tm tm;
-	localtime_r(&ts->tv_sec, &tm);
-
-	const int millisec = (int)(ts->tv_nsec / 1000000);
-
-	snprintf(timestring, TIMESTR_SIZE,
-	         "%d-%02d-%02d %02d:%02d:%02d.%03i %s",
-	         tm.tm_year + 1900,
-	         tm.tm_mon + 1,
-	         tm.tm_mday,
-	         tm.tm_hour,
-	         tm.tm_min,
-	         tm.tm_sec,
-	         millisec,
-	         tm.tm_zone);
-
-	// Ensure null termination
-	timestring[TIMESTR_SIZE - 1] = '\0';
-}
-
+// "YYYY-MM-DDTHH:MM:SS.mmmZ" in UTC, byte-identical to the previous
+// get_timestr_iso8601() - except that the millisecond fraction is taken from
+// the record's production time instead of being re-sampled at drain time.
 static void logger_get_timestr_iso8601(char timestring[TIMESTR_SIZE],
-                                       const struct timespec *ts)
+                                       const double ts)
 {
+	const time_t seconds = (time_t)ts;
 	struct tm tm;
-	gmtime_r(&ts->tv_sec, &tm);
+	gmtime_r(&seconds, &tm);
 
-	// Millisecond precision from the record's production time (the previous
-	// get_timestr_iso8601() only had the second-granular record time and
-	// smuggled in the current millisecond when it happened to match)
-	const int millisec = (int)(ts->tv_nsec / 1000000);
+	const int millisec = (int)((ts - seconds) * 1000.0);
 
 	snprintf(timestring, TIMESTR_SIZE,
 	         "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
@@ -669,7 +643,7 @@ static bool logger_file_line(loggerSink *sink, const struct log_record *rec,
                              const char *prio)
 {
 	char timestring[TIMESTR_SIZE];
-	logger_get_timestr_ms(timestring, &rec->ts);
+	get_timestr(timestring, rec->ts, true, false);
 
 	char idstr[42];
 	logger_get_idstr(idstr, sizeof(idstr), rec);
@@ -696,7 +670,7 @@ static bool logger_file_line(loggerSink *sink, const struct log_record *rec,
 // pihole.log, byte-identical to the previous FTL_write_dnsmasq_log()
 static void logger_dnsmasq_line(struct log_record *rec)
 {
-	time_t now = rec->ts.tv_sec;
+	time_t now = (time_t)rec->ts;
 	char ctime_buf[26];
 	const char *ctime_str = ctime_r(&now, ctime_buf);
 	if(ctime_str == NULL)
@@ -727,7 +701,7 @@ static void logger_dnsmasq_line(struct log_record *rec)
 static void logger_json_line(struct log_record *rec, const char *prio)
 {
 	char timestring_iso8601[TIMESTR_SIZE];
-	logger_get_timestr_iso8601(timestring_iso8601, &rec->ts);
+	logger_get_timestr_iso8601(timestring_iso8601, rec->ts);
 
 	char idstr[42];
 	logger_get_idstr(idstr, sizeof(idstr), rec);
@@ -800,10 +774,9 @@ static void logger_fifo(struct log_record *rec, const char *prio)
 		case LOG_SOURCE_WEBSERVER: which = FIFO_WEBSERVER; break;
 	}
 
-	// Store the record's production timestamp (double epoch seconds, the
-	// same representation double_time() produced in the synchronous logger)
-	const double ts = (double)rec->ts.tv_sec + 1e-9 * (double)rec->ts.tv_nsec;
-	add_to_fifo_buffer(which, rec->message, prio, flen, ts);
+	// Store the record's production timestamp (same double epoch-seconds
+	// representation that double_time() yields for the synchronous path)
+	add_to_fifo_buffer(which, rec->message, prio, flen, rec->ts);
 }
 
 static void logger_dispatch(struct log_record *rec)

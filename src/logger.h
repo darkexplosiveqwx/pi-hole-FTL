@@ -52,7 +52,7 @@ enum log_source {
 // must never contain pointers or heap-allocated payloads: records produced by
 // dnsmasq TCP-query forks are consumed by the main process' logger thread.
 struct log_record {
-	struct timespec ts;      // production time (second + nanosecond)
+	double ts;               // production time (epoch seconds, double_time())
 	int priority;            // syslog priority (see sys/syslog.h)
 	enum debug_flag flag;    // FTL debug flag (used by priostr/debugstr)
 	enum log_source source;  // who produced the record
