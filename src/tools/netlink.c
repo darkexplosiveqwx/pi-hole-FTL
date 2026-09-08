@@ -25,8 +25,11 @@
 extern int private_net(struct in_addr addr, int ban_localhost);
 
 #ifdef __FreeBSD__
-// FreeBSD-specific includes for the non-detailed netlink implementation
+// FreeBSD-specific includes for the netlink implementation
 #include <net/if_types.h>    // IFT_ETHER, IFT_LOOP, IFT_PPP, IFT_TUNNEL
+#include <sys/sysctl.h>      // sysctl()
+#include <net/if.h>          // struct if_data, LINK_STATE_*, IFF_*
+#include <net/if_mib.h>      // struct ifmibdata, NETLINK_GENERIC, IFMIB_*, IFDATA_*
 #endif
 
 #ifndef __FreeBSD__
@@ -1632,12 +1635,362 @@ static bool nlquery(const int type, cJSON *json, const bool detailed)
 #endif /* __FreeBSD__ (end of Linux netlink implementation) */
 
 #ifdef __FreeBSD__
-// FreeBSD implementation: query the routing table via a PF_ROUTE socket
-// and return the default route (gateway + interface).
+/*
+ * FreeBSD implementation: the kernel does not provide netlink, so all data is
+ * collected from the PF_ROUTE sysctl interface (NET_RT_DUMP / NET_RT_FLAGS),
+ * getifaddrs() and the interface MIB (net.link.generic.ifdata.*) instead.
+ *
+ * The Linux implementation reports its results as a set of JSON objects; the
+ * FreeBSD counterparts below use the same field names (and comparable values)
+ * so that the API responses are as close as possible between the two
+ * platforms. The "detailed" flag toggles the additional rich fields.
+ */
+
+/* Fetch a snapshot of the PF_ROUTE table (NET_RT_DUMP) or a subset of it
+ * (NET_RT_FLAGS, e.g., RTF_LLINFO for the L2 neighbor table). Returns the
+ * number of bytes retrieved or -1 on error. The caller owns *buf. */
+static ssize_t fb_rt_sysctl(const int family, const int mode, const int flags, void **buf)
+{
+	// MIB layout: CTL_NET, PF_ROUTE, protocol, address family, info, mask
+	int mib[6] = { CTL_NET, PF_ROUTE, 0, family, mode, flags };
+	size_t len = 0;
+	if(sysctl(mib, 6, NULL, &len, NULL, 0) != 0)
+		return -1;
+	void *data = malloc(len > 0 ? len : 1);
+	if(data == NULL)
+		return -1;
+	if(len > 0 && sysctl(mib, 6, data, &len, NULL, 0) != 0)
+	{
+		free(data);
+		return -1;
+	}
+	*buf = data;
+	return (ssize_t)len;
+}
+
+/* Extract a single sockaddr from a routing message. The kernel stores the
+ * present sockaddrs back-to-back, in ascending order of the bits set in
+ * rtm_addrs (i.e., in RTAX_* order with the absent ones omitted). Returns NULL
+ * if the requested entry is not part of the message. */
+static struct sockaddr *fb_rtm_sockaddr(const struct rt_msghdr *rtm, const int index)
+{
+	if(rtm->rtm_version != RTM_VERSION || !(rtm->rtm_addrs & (1 << index)))
+		return NULL;
+	char *cp = (char *)(rtm + 1);
+	const char *end = (const char *)rtm + rtm->rtm_msglen;
+	for(int i = 0; i <= index && cp < end; i++)
+	{
+		if(!(rtm->rtm_addrs & (1 << i)))
+			continue;
+		if(i == index)
+			return (struct sockaddr *)cp;
+		cp += SA_SIZE((struct sockaddr *)cp);
+	}
+	return NULL;
+}
+
+/* Format an IPv4/IPv6 sockaddr as a string. Returns NULL when the address
+ * cannot be formatted. */
+static const char *fb_sockaddr_string(const struct sockaddr *sa, char *buf, const size_t buflen)
+{
+	if(sa->sa_family == AF_INET)
+		return inet_ntop(AF_INET, &((const struct sockaddr_in *)sa)->sin_addr, buf, buflen);
+	else if(sa->sa_family == AF_INET6)
+		return inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, buf, buflen);
+	return NULL;
+}
+
+/* Return the prefix length encoded in a netmask sockaddr. */
+static int fb_netmask_prefixlen(const struct sockaddr *sa)
+{
+	if(sa == NULL)
+		return 0;
+	int prefixlen = 0;
+	if(sa->sa_family == AF_INET)
+	{
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+		prefixlen = __builtin_popcount(ntohl(sin->sin_addr.s_addr));
+	}
+	else if(sa->sa_family == AF_INET6)
+	{
+		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+		for(unsigned int i = 0; i < sizeof(sin6->sin6_addr.s6_addr); i++)
+			prefixlen += __builtin_popcount(sin6->sin6_addr.s6_addr[i]);
+	}
+	return prefixlen;
+}
+
+/* Return whether an address is the all-zero address (used to detect the
+ * default route). */
+static bool fb_addr_is_zero(const struct sockaddr *sa)
+{
+	if(sa->sa_family == AF_INET)
+		return ((const struct sockaddr_in *)sa)->sin_addr.s_addr == INADDR_ANY;
+	else if(sa->sa_family == AF_INET6)
+		return IN6_IS_ADDR_UNSPECIFIED(&((const struct sockaddr_in6 *)sa)->sin6_addr);
+	return false;
+}
+
+/* Classify an IPv4 address the way the Linux implementation does. */
+static const char *fb_ipv4_type(const struct in_addr *in)
+{
+	if(in->s_addr == INADDR_ANY)
+		return "unspecified";
+	else if(in->s_addr == INADDR_LOOPBACK ||
+	        (in->s_addr & htonl(0xff000000)) == htonl(0x7f000000))
+		return "loopback";
+	else if((in->s_addr & htonl(0xf0000000)) == htonl(0xe0000000))
+		return "multicast";
+	else if(private_net(*in, false))
+		return "private";
+	else if((in->s_addr & htonl(0xffc00000)) == htonl(0x64400000))
+		// RFC 6598: Carrier-Grade NAT (CGN) 100.64.0.0/10
+		return "Carrier-Grade NAT";
+	return "public";
+}
+
+/* Classify an IPv6 address the way the Linux implementation does. */
+static const char *fb_ipv6_type(const struct in6_addr *in6)
+{
+	if(IN6_IS_ADDR_UNSPECIFIED(in6))
+		return "unspecified";
+	else if(IN6_IS_ADDR_LOOPBACK(in6))
+		return "loopback";
+	else if(IN6_IS_ADDR_MULTICAST(in6))
+		return "multicast";
+	else if(IN6_IS_ADDR_LINKLOCAL(in6))
+		return "link-local (LL)";
+	else if(IN6_IS_ADDR_SITELOCAL(in6))
+		return "site-local (ULA)";
+	else if(IN6_IS_ADDR_V4MAPPED(in6))
+		return "IPv4-mapped";
+	else if(IN6_IS_ADDR_V4COMPAT(in6))
+		return "IPv4-compatible";
+	else if(IN6_IS_ADDR_MC_NODELOCAL(in6))
+		return "node-local";
+	else if(IN6_IS_ADDR_MC_LINKLOCAL(in6))
+		return "link-local (LL)";
+	else if(IN6_IS_ADDR_MC_SITELOCAL(in6))
+		return "site-local (ULA)";
+	else if(IN6_IS_ADDR_MC_ORGLOCAL(in6))
+		return "organization-local";
+	else if(IN6_IS_ADDR_MC_GLOBAL(in6))
+		return "global (GUA)";
+	else
+	{
+		uint8_t bytes[2];
+		memcpy(&bytes, in6, 2);
+		// Global Unicast Address (2000::/3, RFC 4291)
+		if((bytes[0] & 0x70) == 0x20)
+			return "global (GUA)";
+		// Unique Local Address (fc00::/7, RFC 4193)
+		else if((bytes[0] & 0xfe) == 0xfc)
+			return "site-local (ULA)";
+		// Link Local Address (fe80::/10, RFC 4291)
+		else if((bytes[0] & 0xff) == 0xfe && (bytes[1] & 0x30) == 0)
+			return "link-local (LL)";
+	}
+	return "unknown";
+}
+
+/* Convert a single routing-table entry into a JSON object matching the field
+ * names of the Linux implementation (nlparsemsg_route()). */
+static void fb_parse_route(cJSON *routes, const struct rt_msghdr *rtm, const bool detailed)
+{
+	// FreeBSD does not report which routing protocol installed a route, so
+	// the route flags are used to approximate the Linux RTPROT_* names
+	const char *protocol = "kernel";
+	if(rtm->rtm_flags & RTF_DYNAMIC)
+		protocol = "redirect";
+	else if(rtm->rtm_flags & RTF_STATIC)
+		protocol = "static";
+
+	// Derive the Linux RT_SCOPE_* name from the route flags: local (and
+	// rejected) routes are scoped to the host, directly connected as well as
+	// broadcast/multicast routes to the link, everything else (gateway
+	// routes) to the universe
+	const char *scope = NULL;
+	if(rtm->rtm_flags & (RTF_LOCAL | RTF_REJECT))
+		scope = "host";
+	else if(rtm->rtm_flags & (RTF_BROADCAST | RTF_MULTICAST))
+		scope = "link";
+	else if(!(rtm->rtm_flags & RTF_GATEWAY))
+		scope = "link";
+	else
+		scope = "universe";
+
+	// Derive the Linux RTN_* name from the route flags
+	const char *type = "unicast";
+	if(rtm->rtm_flags & RTF_LOCAL)
+		type = "local";
+	else if(rtm->rtm_flags & RTF_BROADCAST)
+		type = "broadcast";
+	else if(rtm->rtm_flags & RTF_MULTICAST)
+		type = "multicast";
+	else if(rtm->rtm_flags & RTF_REJECT)
+		type = "unreachable";
+	else if(rtm->rtm_flags & RTF_BLACKHOLE)
+		type = "blackhole";
+
+	const struct sockaddr *dstsock = fb_rtm_sockaddr(rtm, RTAX_DST);
+	const struct sockaddr *gwsock = fb_rtm_sockaddr(rtm, RTAX_GATEWAY);
+	const struct sockaddr *masksock = fb_rtm_sockaddr(rtm, RTAX_NETMASK);
+	const struct sockaddr *ifpsock = fb_rtm_sockaddr(rtm, RTAX_IFP);
+	const struct sockaddr *ifasock = fb_rtm_sockaddr(rtm, RTAX_IFA);
+
+	// Only IPv4 and IPv6 routes are processed (the Linux implementation only
+	// handles IP routes as well)
+	int family = AF_UNSPEC;
+	if(dstsock != NULL)
+		family = dstsock->sa_family;
+	else if(gwsock != NULL)
+		family = gwsock->sa_family;
+	else if(ifasock != NULL)
+		family = ifasock->sa_family;
+	if(family != AF_INET && family != AF_INET6)
+		return;
+
+	cJSON *route = cJSON_CreateObject();
+
+	// FreeBSD indexes its routes by FIB instead of the numbered routing tables
+	// Linux uses. The default FIB (0) corresponds to the Linux "main" table
+	// (RT_TABLE_MAIN = 254), which is reported here so that consumers comparing
+	// both implementations see the same value.
+	cJSON_AddNumberToObject(route, "table", 254);
+	cJSON_AddStringReferenceToObject(route, "family", family == AF_INET ? "inet" : "inet6");
+	cJSON_AddStringReferenceToObject(route, "protocol", protocol);
+	cJSON_AddStringReferenceToObject(route, "scope", scope);
+	cJSON_AddStringReferenceToObject(route, "type", type);
+
+	// Array of human-readable route flags
+	static const struct flag_names fb_rtf_flags[] = {
+		{ RTF_UP, "up" },
+		{ RTF_GATEWAY, "gateway" },
+		{ RTF_HOST, "host" },
+		{ RTF_REJECT, "reject" },
+		{ RTF_DYNAMIC, "dynamic" },
+		{ RTF_MODIFIED, "modified" },
+		{ RTF_STATIC, "static" },
+		{ RTF_BLACKHOLE, "blackhole" },
+		{ RTF_PROTO2, "proto2" },
+		{ RTF_PROTO1, "proto1" },
+		{ RTF_PROTO3, "proto3" },
+		{ RTF_FIXEDMTU, "fixedmtu" },
+		{ RTF_PINNED, "pinned" },
+		{ RTF_LOCAL, "local" },
+		{ RTF_BROADCAST, "broadcast" },
+		{ RTF_MULTICAST, "multicast" },
+		{ RTF_STICKY, "sticky" },
+	};
+	cJSON *flags = cJSON_CreateArray();
+	for(unsigned int i = 0; i < sizeof(fb_rtf_flags)/sizeof(fb_rtf_flags[0]); i++)
+		if(fb_rtf_flags[i].flag & (uint32_t)rtm->rtm_flags)
+			cJSON_AddStringToArray(flags, fb_rtf_flags[i].name);
+	cJSON_AddItemToObject(route, "flags", flags);
+	if(detailed)
+		cJSON_AddNumberToObject(route, "iflags", rtm->rtm_flags);
+
+	// Destination address; the default route has an all-zero destination and
+	// no (or an all-zero) netmask
+	char ip[INET6_ADDRSTRLEN];
+	if(dstsock != NULL)
+	{
+		if(fb_sockaddr_string(dstsock, ip, sizeof(ip)) != NULL)
+		{
+			if(fb_netmask_prefixlen(masksock) == 0 && fb_addr_is_zero(dstsock))
+				cJSON_AddStringToObject(route, "dst", "default");
+			else
+				cJSON_AddStringToObject(route, "dst", ip);
+		}
+	}
+	else
+		cJSON_AddStringToObject(route, "dst", "default");
+
+	// Gateway address
+	if(gwsock != NULL && gwsock->sa_family == family &&
+	   fb_sockaddr_string(gwsock, ip, sizeof(ip)) != NULL)
+		cJSON_AddStringToObject(route, "gateway", ip);
+
+	// Preferred source address (the kernel reports the interface address of
+	// the selected interface in the RTA_IFA sockaddr)
+	if(ifasock != NULL && fb_sockaddr_string(ifasock, ip, sizeof(ip)) != NULL)
+		cJSON_AddStringToObject(route, "prefsrc", ip);
+
+	// Outgoing interface
+	char ifname[IF_NAMESIZE];
+	bool have_oif = false;
+	if(ifpsock != NULL && ifpsock->sa_family == AF_LINK)
+	{
+		const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)ifpsock;
+		if(sdl->sdl_nlen > 0 && sdl->sdl_nlen < sizeof(ifname))
+		{
+			memcpy(ifname, sdl->sdl_data, sdl->sdl_nlen);
+			ifname[sdl->sdl_nlen] = '\0';
+			cJSON_AddStringToObject(route, "oif", ifname);
+			have_oif = true;
+		}
+	}
+	if(!have_oif && rtm->rtm_index != 0 && if_indextoname(rtm->rtm_index, ifname) != NULL)
+		cJSON_AddStringToObject(route, "oif", ifname);
+
+	// Debug output
+	if(config.debug.netlink.v.b)
+	{
+		const cJSON* dst = cJSON_GetObjectItem(route, "dst");
+		const cJSON *gw = cJSON_GetObjectItem(route, "gateway");
+		log_debug(DEBUG_NETLINK, "Parsing IPv%d route: %s via %s",
+		          family == AF_INET ? 4 : 6,
+		          dst ? dst->valuestring : "N/A",
+		          gw ? gw->valuestring : "direct");
+	}
+
+	cJSON_AddItemToArray(routes, route);
+}
+
+/* Iterate over a NET_RT_DUMP snapshot and append each route as a JSON object
+ * to the routes array. */
+static bool fb_parse_routes(cJSON *routes, const bool detailed, const int family)
+{
+	void *buf = NULL;
+	const ssize_t len = fb_rt_sysctl(family, NET_RT_DUMP, 0, &buf);
+	if(len < 0)
+	{
+		log_err("Failed to read routing table: %s", strerror(errno));
+		return false;
+	}
+
+	struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
+	ssize_t left = len;
+	while(left >= (ssize_t)sizeof(struct rt_msghdr) &&
+	      rtm->rtm_msglen >= sizeof(struct rt_msghdr) &&
+	      (size_t)rtm->rtm_msglen <= (size_t)left)
+	{
+		if(rtm->rtm_version == RTM_VERSION)
+			fb_parse_route(routes, rtm, detailed);
+		left -= rtm->rtm_msglen;
+		rtm = (struct rt_msghdr *)((char *)rtm + rtm->rtm_msglen);
+	}
+	free(buf);
+	return true;
+}
+
 bool nlroutes(cJSON *routes, const bool detailed)
 {
-	(void)detailed; // non-detailed implementation ignores this flag
 	log_debug(DEBUG_NETLINK, "Called nlroutes (FreeBSD, detailed = %s)", detailed ? "true" : "false");
+
+	if(detailed)
+	{
+		// Return the full routing table with the same field names as the
+		// Linux implementation
+		bool ok = true;
+		if(!fb_parse_routes(routes, detailed, AF_INET))
+			ok = false;
+		if(!fb_parse_routes(routes, detailed, AF_INET6))
+			ok = false;
+		return ok;
+	}
+
+	// Non-detailed: report only the default route (gateway + interface)
 
 	// Open a route socket
 	int fd = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
@@ -1774,7 +2127,6 @@ bool nlroutes(cJSON *routes, const bool detailed)
 // FreeBSD implementation: use getifaddrs() to enumerate interfaces and their addresses
 bool nladdrs(cJSON *interfaces, const bool detailed)
 {
-	(void)detailed; // non-detailed implementation ignores this flag
 	log_debug(DEBUG_NETLINK, "Called nladdrs (FreeBSD, detailed = %s)", detailed ? "true" : "false");
 
 	struct ifaddrs *ifap = NULL;
@@ -1805,18 +2157,17 @@ bool nladdrs(cJSON *interfaces, const bool detailed)
 			cJSON_AddItemToObject(ifobj, "addresses", addrs);
 		}
 
+		// Only IPv4 and IPv6 addresses are processed
+		if(ifa->ifa_addr->sa_family != AF_INET && ifa->ifa_addr->sa_family != AF_INET6)
+			continue;
+
 		cJSON *addr = cJSON_CreateObject();
 
 		// Family
 		if(ifa->ifa_addr->sa_family == AF_INET)
 			cJSON_AddStringToObject(addr, "family", "inet");
-		else if(ifa->ifa_addr->sa_family == AF_INET6)
-			cJSON_AddStringToObject(addr, "family", "inet6");
 		else
-		{
-			cJSON_Delete(addr);
-			continue;
-		}
+			cJSON_AddStringToObject(addr, "family", "inet6");
 
 		// Address
 		char ip[INET6_ADDRSTRLEN];
@@ -1826,34 +2177,36 @@ bool nladdrs(cJSON *interfaces, const bool detailed)
 			if(inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
 				cJSON_AddStringToObject(addr, "address", ip);
 		}
-		else if(ifa->ifa_addr->sa_family == AF_INET6)
+		else
 		{
 			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
 			if(inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
 				cJSON_AddStringToObject(addr, "address", ip);
 		}
 
-		// Netmask / prefixlen
-		if(ifa->ifa_netmask != NULL)
+		// "local" is a mirror of "address"; Linux reports both fields
+		// (IFA_LOCAL and IFA_ADDRESS hold the same value for typical
+		// non-point-to-point addresses)
+		const cJSON *address = cJSON_GetObjectItem(addr, "address");
+		if(cJSON_IsString(address))
+			cJSON_AddStringReferenceToObject(addr, "local", address->valuestring);
+
+		// Interface index (detailed only, like the Linux implementation)
+		if(detailed)
 		{
-			if(ifa->ifa_addr->sa_family == AF_INET)
-			{
-				struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_netmask;
-				uint32_t mask = ntohl(sin->sin_addr.s_addr);
-				int prefixlen = __builtin_popcount(mask);
-				cJSON_AddNumberToObject(addr, "prefixlen", prefixlen);
-			}
-			else if(ifa->ifa_addr->sa_family == AF_INET6)
-			{
-				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
-				int prefixlen = 0;
-				for(int i = 0; i < 16; i++)
-					prefixlen += __builtin_popcount(sin6->sin6_addr.s6_addr[i]);
-				cJSON_AddNumberToObject(addr, "prefixlen", prefixlen);
-			}
+			unsigned int ifindex = if_nametoindex(ifa->ifa_name);
+			if(ifindex > 0)
+				cJSON_AddNumberToObject(addr, "index", ifindex);
 		}
 
-		// Scope (basic)
+		// Netmask / prefixlen
+		if(ifa->ifa_netmask != NULL)
+			cJSON_AddNumberToObject(addr, "prefixlen", fb_netmask_prefixlen(ifa->ifa_netmask));
+
+		// Scope: mirror the values the Linux implementation derives from the
+		// IPv6 scope (RT_SCOPE_HOST / RT_SCOPE_LINK / RT_SCOPE_UNIVERSE). The
+		// loopback address and IPv6 link-local addresses are scoped to the
+		// host/link respectively, everything else is scoped to the universe.
 		if(ifa->ifa_addr->sa_family == AF_INET6)
 		{
 			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
@@ -1862,14 +2215,51 @@ bool nladdrs(cJSON *interfaces, const bool detailed)
 			else if(IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr))
 				cJSON_AddStringToObject(addr, "scope", "host");
 			else
-				cJSON_AddStringToObject(addr, "scope", "global");
+				cJSON_AddStringToObject(addr, "scope", "universe");
 		}
 		else
 		{
-			cJSON_AddStringToObject(addr, "scope", "global");
+			struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+			if(ntohl(sin->sin_addr.s_addr) >= 0x7f000000 && ntohl(sin->sin_addr.s_addr) <= 0x7fffffff)
+				cJSON_AddStringToObject(addr, "scope", "host");
+			else
+				cJSON_AddStringToObject(addr, "scope", "universe");
 		}
 
-		// Flags
+		// Broadcast address (IPv4 only, detailed only like Linux, which skips
+		// IPv6 broadcast addresses)
+		if(detailed && ifa->ifa_addr->sa_family == AF_INET &&
+		   (ifa->ifa_flags & IFF_BROADCAST) && ifa->ifa_broadaddr != NULL)
+		{
+			struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_broadaddr;
+			if(inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
+			{
+				cJSON_AddStringToObject(addr, "broadcast", ip);
+				cJSON_AddStringToObject(addr, "broadcast_type", fb_ipv4_type(&sin->sin_addr));
+			}
+		}
+
+		// Address type (detailed only), using the same classification as the
+		// Linux implementation
+		if(detailed)
+		{
+			if(ifa->ifa_addr->sa_family == AF_INET)
+			{
+				struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+				cJSON_AddStringToObject(addr, "address_type", fb_ipv4_type(&sin->sin_addr));
+				cJSON_AddStringToObject(addr, "local_type", fb_ipv4_type(&sin->sin_addr));
+			}
+			else
+			{
+				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+				cJSON_AddStringToObject(addr, "address_type", fb_ipv6_type(&sin6->sin6_addr));
+				cJSON_AddStringToObject(addr, "local_type", fb_ipv6_type(&sin6->sin6_addr));
+			}
+		}
+
+		// Flags: the Linux implementation always emits "up" and "loopback"
+		// (and "multicast" when IFF_MULTICAST); the remaining flags are only
+		// reported in detailed mode
 		cJSON *flags = cJSON_CreateArray();
 		if(ifa->ifa_flags & IFF_UP)
 			cJSON_AddStringToArray(flags, "up");
@@ -1877,6 +2267,17 @@ bool nladdrs(cJSON *interfaces, const bool detailed)
 			cJSON_AddStringToArray(flags, "loopback");
 		if(ifa->ifa_flags & IFF_RUNNING)
 			cJSON_AddStringToArray(flags, "running");
+		if(detailed)
+		{
+			if(ifa->ifa_flags & IFF_BROADCAST)
+				cJSON_AddStringToArray(flags, "broadcast");
+			if(ifa->ifa_flags & IFF_POINTOPOINT)
+				cJSON_AddStringToArray(flags, "pointopoint");
+			if(ifa->ifa_flags & IFF_NOARP)
+				cJSON_AddStringToArray(flags, "noarp");
+			if(ifa->ifa_flags & IFF_MULTICAST)
+				cJSON_AddStringToArray(flags, "multicast");
+		}
 		cJSON_AddItemToObject(addr, "flags", flags);
 
 		cJSON_AddItemToArray(addrs, addr);
@@ -1905,10 +2306,10 @@ bool nladdrs(cJSON *interfaces, const bool detailed)
  * @return true on success, false on failure.
  */
 #ifdef __FreeBSD__
-// FreeBSD implementation: use getifaddrs() to enumerate interfaces
+// FreeBSD implementation: use getifaddrs() to enumerate interfaces and the
+// interface MIB (net.link.generic.ifdata.*) for link-level details
 bool nllinks(cJSON *interfaces, const bool detailed)
 {
-	(void)detailed; // non-detailed implementation ignores this flag
 	log_debug(DEBUG_NETLINK, "Called nllinks (FreeBSD, detailed = %s)", detailed ? "true" : "false");
 
 	struct ifaddrs *ifap = NULL;
@@ -1938,6 +2339,11 @@ bool nllinks(cJSON *interfaces, const bool detailed)
 		unsigned int ifindex = if_nametoindex(ifa->ifa_name);
 		if(ifindex > 0)
 			cJSON_AddNumberToObject(link, "index", ifindex);
+
+		// Interface ID and family only in detailed mode (like Linux); the
+		// kernel does not report a family for links, so AF_UNSPEC is used
+		if(detailed)
+			cJSON_AddStringToObject(link, "family", "unspec");
 
 		// Type (from if_data if available, otherwise default to ether)
 		struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
@@ -1984,11 +2390,88 @@ bool nllinks(cJSON *interfaces, const bool detailed)
 			cJSON_AddStringToArray(flags, "multicast");
 		cJSON_AddItemToObject(link, "flags", flags);
 
-		// MTU
-		if(ifa->ifa_data != NULL)
+		// Link-level details (MTU, speed, carrier, operational state and
+		// statistics) are read from the interface MIB in detailed mode
+		if(detailed && ifindex > 0)
 		{
-			// if_data is only available if we use ifmib, not getifaddrs
-			// For now, skip MTU in non-detailed mode
+			// MIB layout: CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA,
+			// ifindex, IFDATA_GENERAL
+			int mib[6] = { CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, (int)ifindex, IFDATA_GENERAL };
+			struct ifmibdata ifmd = { 0 };
+			size_t len = sizeof(ifmd);
+			if(sysctl(mib, 6, &ifmd, &len, NULL, 0) == 0 && len == sizeof(ifmd))
+			{
+				struct if_data *ifd = &ifmd.ifmd_data;
+
+				// Interface MTU
+				cJSON_AddNumberToObject(link, "mtu", ifd->ifi_mtu);
+
+				// Interface speed: the kernel reports the nominal link
+				// bandwidth in bits per second, converted to Mbit/s to
+				// match the Linux implementation (which reads it from
+				// /sys/class/net/*/speed). NULL when the device does not
+				// report a rate.
+				if(ifd->ifi_baudrate > 0)
+					cJSON_AddNumberToObject(link, "speed", (double)ifd->ifi_baudrate / 1000000.0);
+				else
+					cJSON_AddNullToObject(link, "speed");
+
+				// Carrier: the Linux implementation reports whether a
+				// carrier is present (IFLA_CARRIER). FreeBSD reports the
+				// link state, only fully UP meaning a carrier is present.
+				cJSON_AddBoolToObject(link, "carrier", ifd->ifi_link_state == LINK_STATE_UP ? true : false);
+
+				// Operational state, using the same strings as the Linux
+				// implementation (ifstates table)
+				if(ifd->ifi_link_state == LINK_STATE_UP)
+					cJSON_AddStringToObject(link, "state", "up");
+				else if(ifd->ifi_link_state == LINK_STATE_DOWN)
+					cJSON_AddStringToObject(link, "state", "down");
+				else
+					cJSON_AddStringToObject(link, "state", "unknown");
+
+				// Interface statistics: structured like the Linux
+				// implementation with the received/transmitted byte
+				// counters formatted for human readability and the packet
+				// and error counters as plain numbers
+				cJSON *stats = cJSON_CreateObject();
+				if(stats != NULL)
+				{
+					{
+						char prefix[2] = { 0 };
+						double formatted_size;
+						format_memory_size(prefix, (off_t)ifd->ifi_ibytes, &formatted_size);
+						cJSON *rx_bytes = cJSON_CreateObject();
+						cJSON_AddNumberToObject(rx_bytes, "value", formatted_size);
+						cJSON_AddStringToObject(rx_bytes, "unit", prefix);
+						cJSON_AddItemToObject(stats, "rx_bytes", rx_bytes);
+					}
+					{
+						char prefix[2] = { 0 };
+						double formatted_size;
+						format_memory_size(prefix, (off_t)ifd->ifi_obytes, &formatted_size);
+						cJSON *tx_bytes = cJSON_CreateObject();
+						cJSON_AddNumberToObject(tx_bytes, "value", formatted_size);
+						cJSON_AddStringToObject(tx_bytes, "unit", prefix);
+						cJSON_AddItemToObject(stats, "tx_bytes", tx_bytes);
+					}
+					cJSON_AddNumberToObject(stats, "bits", 64);
+					cJSON_AddNumberToObject(stats, "rx_packets", ifd->ifi_ipackets);
+					cJSON_AddNumberToObject(stats, "tx_packets", ifd->ifi_opackets);
+					cJSON_AddNumberToObject(stats, "rx_errors", ifd->ifi_ierrors);
+					cJSON_AddNumberToObject(stats, "tx_errors", ifd->ifi_oerrors);
+					cJSON_AddNumberToObject(stats, "rx_dropped", ifd->ifi_iqdrops);
+					cJSON_AddNumberToObject(stats, "tx_dropped", ifd->ifi_oqdrops);
+					cJSON_AddNumberToObject(stats, "multicast", ifd->ifi_imcasts);
+					cJSON_AddNumberToObject(stats, "collisions", ifd->ifi_collisions);
+					cJSON_AddItemToObject(link, "stats", stats);
+				}
+			}
+			else
+			{
+				log_debug(DEBUG_NETLINK, "Failed to read interface MIB for %s: %s",
+				          ifa->ifa_name, strerror(errno));
+			}
 		}
 	}
 
@@ -2011,14 +2494,94 @@ bool nllinks(cJSON *interfaces, const bool detailed)
  * @return true on success, false on failure
  */
 #ifdef __FreeBSD__
-// FreeBSD implementation: the full ARP/NDP cache would require parsing a
-// sysctl(CTL_NET, PF_ROUTE, NET_RT_DUMP, ...) dump; the non-detailed version
-// returns an empty array for now.
+/* Iterate over a NET_RT_DUMP RTF_LLINFO snapshot and append each L2 neighbor
+ * entry (ARP for AF_INET, NDP for AF_INET6) as a JSON object to the
+ * arp_entries array. */
+static bool fb_parse_neigh(cJSON *arp_entries, const int family)
+{
+	void *buf = NULL;
+	const ssize_t len = fb_rt_sysctl(family, NET_RT_FLAGS, RTF_LLINFO, &buf);
+	if(len < 0)
+	{
+		log_err("Failed to read neighbor cache: %s", strerror(errno));
+		return false;
+	}
+
+	struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
+	ssize_t left = len;
+	while(left >= (ssize_t)sizeof(struct rt_msghdr) &&
+	      rtm->rtm_msglen >= sizeof(struct rt_msghdr) &&
+	      (size_t)rtm->rtm_msglen <= (size_t)left)
+	{
+		if(rtm->rtm_version == RTM_VERSION)
+		{
+			const struct sockaddr *dst = fb_rtm_sockaddr(rtm, RTAX_DST);
+			const struct sockaddr *gw = fb_rtm_sockaddr(rtm, RTAX_GATEWAY);
+			// An L2 neighbor entry carries the resolved MAC address in its
+			// (AF_LINK) gateway sockaddr; entries without one (e.g.,
+			// unresolved neighbors) are skipped
+			if(dst != NULL && gw != NULL && gw->sa_family == AF_LINK)
+			{
+				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)gw;
+				if(sdl->sdl_alen == 6)
+				{
+					char ip[INET6_ADDRSTRLEN];
+					if(fb_sockaddr_string(dst, ip, sizeof(ip)) != NULL)
+					{
+						const unsigned char *addr = (const unsigned char *)LLADDR(sdl);
+						char mac[18];
+						snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+						         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+
+						cJSON *entry = cJSON_CreateObject();
+						cJSON_AddStringToObject(entry, "ip", ip);
+						cJSON_AddStringToObject(entry, "mac", mac);
+
+						// Interface name
+						char ifname[IF_NAMESIZE];
+						if(sdl->sdl_index != 0 && if_indextoname(sdl->sdl_index, ifname) != NULL)
+							cJSON_AddStringToObject(entry, "iface", ifname);
+						else if(rtm->rtm_index != 0 && if_indextoname(rtm->rtm_index, ifname) != NULL)
+							cJSON_AddStringToObject(entry, "iface", ifname);
+
+						// The neighbor state is only available to the
+						// debug log; the API consumer (ARP table) does not
+						// use it
+						if(config.debug.arp.v.b || config.debug.netlink.v.b)
+						{
+							cJSON_AddNumberToObject(entry, "state", rtm->rtm_rmx.rmx_state);
+							cJSON_AddNumberToObject(entry, "type", 1);
+							cJSON_AddNumberToObject(entry, "flags", rtm->rtm_flags);
+						}
+
+						const cJSON *iface = cJSON_GetObjectItem(entry, "iface");
+						log_debug(DEBUG_NETLINK, "Fetched neighbor entry: %s -> %s on %s",
+						          ip, mac, cJSON_IsString(iface) ? iface->valuestring : "N/A");
+
+						cJSON_AddItemToArray(arp_entries, entry);
+					}
+				}
+			}
+		}
+		left -= rtm->rtm_msglen;
+		rtm = (struct rt_msghdr *)((char *)rtm + rtm->rtm_msglen);
+	}
+	free(buf);
+	return true;
+}
+
 bool nlneigh(cJSON *arp_entries)
 {
-	(void)arp_entries;
-	log_debug(DEBUG_NETLINK, "Called nlneigh (FreeBSD, returning empty array)");
-	return true;
+	log_debug(DEBUG_NETLINK, "Called nlneigh (FreeBSD)");
+
+	// The full ARP (IPv4) and NDP (IPv6) caches are read from the kernel's
+	// L2 neighbor table (RTF_LLINFO entries in the routing table)
+	bool ok = true;
+	if(!fb_parse_neigh(arp_entries, AF_INET))
+		ok = false;
+	if(!fb_parse_neigh(arp_entries, AF_INET6))
+		ok = false;
+	return ok;
 }
 #else
 bool nlneigh(cJSON *arp_entries)
