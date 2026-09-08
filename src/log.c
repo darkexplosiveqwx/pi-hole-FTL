@@ -98,10 +98,13 @@ double double_time(void)
 }
 
 // Get a human-readable time string
-void get_timestr(char timestring[TIMESTR_SIZE], const time_t timein, const bool millis, const bool uri_compatible)
+// timein is a double epoch-seconds timestamp as produced by double_time() so
+// that the millisecond fraction comes from the timestamp itself
+void get_timestr(char timestring[TIMESTR_SIZE], const double timein, const bool millis, const bool uri_compatible)
 {
+	const time_t seconds = (time_t)timein;
 	struct tm tm;
-	localtime_r(&timein, &tm);
+	localtime_r(&seconds, &tm);
 	char space = ' ';
 	char colon = ':';
 	if(uri_compatible)
@@ -112,9 +115,7 @@ void get_timestr(char timestring[TIMESTR_SIZE], const time_t timein, const bool 
 
 	if(millis)
 	{
-		struct timeval tv;
-		gettimeofday(&tv, NULL);
-		const int millisec = tv.tv_usec/1000;
+		const int millisec = (int)((timein - seconds) * 1000.0);
 
 		snprintf(timestring, TIMESTR_SIZE, "%d-%02d-%02d%c%02d%c%02d%c%02d.%03i%c%s",
 		        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, space,

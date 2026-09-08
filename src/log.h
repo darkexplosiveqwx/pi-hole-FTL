@@ -52,7 +52,7 @@ unsigned int get_year(const time_t timein);
 const char *get_FTL_version(void);
 void log_FTL_version(bool crashreport);
 double double_time(void);
-void get_timestr(char timestring[TIMESTR_SIZE], const time_t timein, const bool millis, const bool uri_compatible);
+void get_timestr(char timestring[TIMESTR_SIZE], const double timein, const bool millis, const bool uri_compatible);
 bool FTL_want_stdout(void);
 void get_idstr(char *idstr, size_t size);
 const char *priostr(const int priority, const enum debug_flag flag)  __attribute__((const));
