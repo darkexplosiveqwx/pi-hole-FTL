@@ -99,7 +99,7 @@ void *timer(void *val)
 {
 	(void)val;
 	// Set thread name
-	prctl(PR_SET_NAME, thread_names[TIMER], 0, 0, 0);
+	FTL_set_thread_name(thread_names[TIMER]);
 
 	// Save timestamp as we do not want to store immediately
 	// to the database

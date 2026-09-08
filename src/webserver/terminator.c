@@ -56,8 +56,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <sys/prctl.h>
+// PR_SET_NAME is provided via FTL.h
+#ifndef __FreeBSD__
 #include <sys/eventfd.h>
+#endif
 #include <pthread.h>
 #include <poll.h>
 #include <unistd.h>
@@ -2503,7 +2505,18 @@ struct h3_job {
 	uint8_t  answer[DNS_MSG_MAX]; ssize_t alen;
 };
 #define H3_DOH_WORKERS 4
+// DoH-resolve wakeup channel. On Linux this is a single eventfd; on FreeBSD an
+// eventfd does not exist, so the same role is played by a pipe whose read end is
+// polled by the loop and whose write end is signalled by a worker. h3_wake_fd is
+// always the fd the loop polls and drains; h3_wake_write_fd is only used (and
+// distinct) on the FreeBSD pipe path.
 static int h3_wake_fd = -1;
+#ifndef __FreeBSD__
+#define h3_wake_write_fd h3_wake_fd
+#else
+static int h3_wake_write_fd = -1;
+static int h3_wake_fds[2] = { -1, -1 };
+#endif
 static uint64_t h3_gen_ctr = 0;                 // loop-thread only
 static pthread_t h3_workers[H3_DOH_WORKERS];
 static unsigned h3_workers_n = 0;
@@ -3543,6 +3556,54 @@ static int h3_event_timeout_ms(SSL *listener, struct h3_conn *conns)
 	return best;
 }
 
+// Wakeup-channel abstraction for signalling the HTTP/3 loop that a DoH resolve
+// finished. Linux uses an eventfd (a single fd read and written); FreeBSD has no
+// eventfd, so we fall back to a self-pipe whose read end is polled and drained
+// and whose write end is signalled by the worker. The loop polls h3_wake_fd and
+// drains it with wake_fd_drain(); workers signal with wake_fd_signal().
+static void wake_fd_create(void)
+{
+#ifdef __FreeBSD__
+	if(pipe2(h3_wake_fds, O_NONBLOCK | O_CLOEXEC) == 0)
+	{
+		h3_wake_fd = h3_wake_fds[0];
+		h3_wake_write_fd = h3_wake_fds[1];
+	}
+#else
+	h3_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#endif
+}
+static void wake_fd_signal(void)
+{
+	const uint64_t one = 1;
+	if(h3_wake_write_fd >= 0)
+		if(write(h3_wake_write_fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
+			{ /* the loop also drains every iteration, so a lost wake only adds latency */ }
+}
+static void wake_fd_drain(void)
+{
+	if(h3_wake_fd < 0)
+		return;
+#ifdef __FreeBSD__
+	uint8_t buf[256];
+	while(read(h3_wake_fd, buf, sizeof(buf)) < 0 && errno == EINTR)
+		{}
+#else
+	uint64_t v;
+	if(read(h3_wake_fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
+		{ /* EAGAIN */ }
+#endif
+}
+static void wake_fd_close(void)
+{
+	if(h3_wake_fd >= 0) { close(h3_wake_fd); h3_wake_fd = -1; }
+#ifndef __FreeBSD__
+	// Single fd on Linux; nothing extra to close.
+#else
+	if(h3_wake_write_fd >= 0) { close(h3_wake_write_fd); h3_wake_write_fd = -1; }
+#endif
+}
+
 // HTTP/3 event-loop thread: own the UDP socket, the QUIC listener, and every
 // connection and stream. One poll() over the shared UDP socket drives OpenSSL's
 // event handling; the rest is bookkeeping to bridge HTTP/3 to the backend.
@@ -3551,7 +3612,7 @@ static int h3_event_timeout_ms(SSL *listener, struct h3_conn *conns)
 static void *h3_doh_worker(void *arg)
 {
 	(void)arg;
-	prctl(PR_SET_NAME, "terminator-doh", 0, 0, 0);
+	FTL_set_thread_name("terminator-doh");
 	for(;;)
 	{
 		pthread_mutex_lock(&h3_jobs_mtx);
@@ -3576,9 +3637,7 @@ static void *h3_doh_worker(void *arg)
 		job->next = h3_jobs_done;
 		h3_jobs_done = job;
 		pthread_mutex_unlock(&h3_jobs_mtx);
-		const uint64_t one = 1;
-		if(write(h3_wake_fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
-			{ /* the loop also drains every iteration, so a lost wake only adds latency */ }
+		wake_fd_signal();
 	}
 	return NULL;
 }
@@ -3639,7 +3698,7 @@ static void h3_drain_resolved(struct h3_conn *conns)
 static void *quic_accept_loop(void *arg)
 {
 	(void)arg;
-	prctl(PR_SET_NAME, "terminator-h3", 0, 0, 0);
+	FTL_set_thread_name("terminator-h3");
 
 	SSL *listener = SSL_new_listener(quic_ctx, 0);
 	if(listener == NULL)
@@ -3797,10 +3856,10 @@ static void *quic_accept_loop(void *arg)
 		}
 
 		// Submit answers for DoH resolves completed off-loop. Drain the wakeup
-		// eventfd (an EFD read returns and clears the accumulated count) and run
+		// channel (an EFD/pipe read clears the accumulated count) and run
 		// the drain every iteration so a coalesced/lost wake only adds latency.
 		if(pfds[1].revents & POLLIN)
-		{ uint64_t v; if(read(h3_wake_fd, &v, sizeof(v)) != (ssize_t)sizeof(v)) { /* EAGAIN */ } }
+			wake_fd_drain();
 		h3_drain_resolved(conns);
 
 		// Service the backend sockets first. Streams are reaped only at the end of
@@ -3983,7 +4042,7 @@ static void terminator_quic_start(const char *bind_addr, int public_port, const 
 	// /dns-query with 503 rather than serving DoH natively.
 	h3_workers_stop = false;
 	h3_workers_n = 0;
-	h3_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	wake_fd_create();
 	if(h3_wake_fd >= 0)
 		for(unsigned i = 0; i < H3_DOH_WORKERS; i++)
 			if(pthread_create(&h3_workers[h3_workers_n], NULL, h3_doh_worker, NULL) == 0)
@@ -4000,7 +4059,7 @@ static void terminator_quic_start(const char *bind_addr, int public_port, const 
 		for(unsigned i = 0; i < h3_workers_n; i++)
 			pthread_join(h3_workers[i], NULL);
 		h3_workers_n = 0;
-		if(h3_wake_fd >= 0) { close(h3_wake_fd); h3_wake_fd = -1; }
+		wake_fd_close();
 		close(quic_fd);
 		quic_fd = -1;
 		SSL_CTX_free(quic_ctx);
@@ -4040,7 +4099,7 @@ static void terminator_quic_stop(void)
 		for(struct h3_job *j = h3_jobs_pending; j != NULL; )
 		{ struct h3_job *n = j->next; free(j); j = n; }
 		h3_jobs_done = h3_jobs_pending = NULL;
-		if(h3_wake_fd >= 0) { close(h3_wake_fd); h3_wake_fd = -1; }
+		wake_fd_close();
 	}
 	if(quic_fd >= 0)
 	{
@@ -4165,7 +4224,7 @@ cleanup:
 static void *accept_loop(void *arg)
 {
 	(void)arg;
-	prctl(PR_SET_NAME, "terminator", 0, 0, 0);
+	FTL_set_thread_name("terminator");
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);

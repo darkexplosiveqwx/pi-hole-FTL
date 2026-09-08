@@ -275,11 +275,20 @@ static bool settime_skew(const double offset)
 
 	struct timex tx = { 0 };
 	tx.offset = 1000000 * offset;
+#ifdef __FreeBSD__
+	// FreeBSD has no adjtimex(); the equivalent clock-disciplining interface is
+	// ntp_adjtime() from <sys/timex.h>, using MOD_OFFSET for a single-shot
+	// offset adjustment (the tx.offset field is in microseconds by default).
+	tx.modes = MOD_OFFSET;
+	const int rc = ntp_adjtime(&tx);
+#else
 	tx.modes = ADJ_OFFSET_SINGLESHOT;
+	const int rc = adjtimex(&tx);
+#endif
 
 	log_debug(DEBUG_NTP, "Gradually adjusting system time by %"PRId64" us", (int64_t)tx.offset);
 
-	if(adjtimex(&tx) < 0)
+	if(rc < 0)
 	{
 		char errbuf[1024];
 		strncpy(errbuf, "Failed to adjust time during NTP sync: ", sizeof(errbuf));
@@ -765,7 +774,7 @@ static void *ntp_client_thread(void *arg)
 {
 	(void)arg;
 	// Set thread name
-	prctl(PR_SET_NAME, thread_names[NTP_CLIENT], 0, 0, 0);
+	FTL_set_thread_name(thread_names[NTP_CLIENT]);
 
 	// Artificial initial delay to allow DNS server to become available
 	thread_sleepms(NTP_CLIENT, 1000 * 10);

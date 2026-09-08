@@ -25,6 +25,13 @@
 #include "config/toml_helper.h"
 // escape_json()
 #include "webserver/http-common.h"
+
+// FreeBSD's standard headers do not declare the POSIX environ symbol; declare
+// it explicitly here. Not needed on Linux, where <unistd.h> already does.
+#ifdef __FreeBSD__
+extern char **environ;
+#endif
+
 struct env_item
 {
 	bool used :1;

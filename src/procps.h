@@ -51,5 +51,6 @@ double parse_proc_self_stat(void);
 bool parse_proc_meminfo(struct proc_meminfo *mem);
 double parse_proc_stat(void);
 pid_t search_proc(const char *name);
+unsigned int count_processes(void);
 
 #endif // PROCPS_H

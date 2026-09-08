@@ -51,7 +51,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/prctl.h>
+// PR_SET_NAME is provided via FTL.h
 #include <time.h>
 
 // Cap concurrent DoT connections so a flood cannot exhaust memory. Each slot
@@ -709,7 +709,7 @@ static void dot_accept_all(int lfd)
 void *dotdoh_dot_thread(void *val)
 {
 	(void)val;
-	prctl(PR_SET_NAME, thread_names[DOTDOH_DOT], 0, 0, 0);
+	FTL_set_thread_name(thread_names[DOTDOH_DOT]);
 
 	// The main thread handles termination signals; this loop only checks `killed`.
 	sigset_t set;

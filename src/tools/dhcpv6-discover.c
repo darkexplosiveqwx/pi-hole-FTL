@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <inttypes.h>
 #include <errno.h>
 #include <unistd.h>
@@ -455,7 +456,9 @@ static int parse_ra(const uint8_t *buf, size_t len)
 
 	printf("  Stateful address conf.: %s\n", (ra->nd_ra_flags_reserved & ND_RA_FLAG_MANAGED) ? "Yes" : "No");
 	printf("  Stateful other conf.: %s\n", (ra->nd_ra_flags_reserved & ND_RA_FLAG_OTHER) ? "Yes" : "No");
+#ifdef ND_RA_FLAG_HOME_AGENT
 	printf("  Mobile home agent: %s\n", (ra->nd_ra_flags_reserved & ND_RA_FLAG_HOME_AGENT) ? "Yes" : "No");
+#endif
 	printf("  Router preference: %s\n", parse_pref(ra->nd_ra_flags_reserved));
 	printf("  Neighbor discovery proxy: %s\n", (ra->nd_ra_flags_reserved & 0x04) ? "Yes" : "No");
 

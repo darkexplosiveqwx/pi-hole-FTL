@@ -18,13 +18,26 @@
 #include "timers.h"
 // check_capability()
 #include "capabilities.h"
-#include <linux/capability.h>
 
+#ifdef __FreeBSD__
+// FreeBSD replaces Linux AF_PACKET sockets with Berkeley Packet Filter (BPF):
+// raw L2 frames are read/written through a /dev/bpf device.  See
+// net/bpf(4).  Frame parsing uses struct ether_header from <net/ethernet.h>.
+#include <fcntl.h>        // open() - the /dev/bpf* device
+#include <unistd.h>       // read()/write()/close() on the BPF device
+#include <sys/ioctl.h>    // ioctl() - BIOCSETIF/BIOCSHDRCMPLT/BIOCSETF/BIOCIMMEDIATE
+#include <net/bpf.h>      // struct bpf_insn/program/hdr, BPF_* ioctls
+#include <net/ethernet.h> // struct ether_header, ETHERTYPE_ARP/IP, ETHER_HDR_LEN
+#include <net/if.h>       // struct ifreq, IFNAMSIZ
+// htons() etc
+#include <arpa/inet.h>
+#else
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/if_arp.h>
 //htons etc
 #include <arpa/inet.h>
+#endif
 
 // How many threads do we spawn at maximum?
 // This is also the limit for interfaces
@@ -65,6 +78,21 @@ struct arp_header {
 	unsigned char target_ip[IPV4_LENGTH];
 };
 #pragma pack(pop)
+
+// Portable Ethernet header (14 bytes).  Layout is identical on Linux and
+// FreeBSD; defined locally so we don't depend on <linux/if_ether.h> for
+// struct ethhdr or its member names (h_dest/h_source/h_proto vs
+// ether_dhost/ether_shost/ether_type).  The ethertype values match standard
+// constants (ETH_P_ARP/ETHERTYPE_ARP = 0x0806, ETH_P_IP/ETHERTYPE_IP = 0x0800).
+#pragma pack(push, 1)
+struct eth_hdr {
+	unsigned char dest[6];
+	unsigned char source[6];
+	unsigned short ethertype;
+};
+#pragma pack(pop)
+
+#define PROTO_IP 0x0800 // IPv4 ethertype (ETH_P_IP / ETHERTYPE_IP)
 
 struct arp_result {
 	struct device {
@@ -129,38 +157,45 @@ static int send_arps(const int fd, const int ifindex, struct thread_data *thread
 	unsigned char buffer[BUF_SIZE];
 	memset(buffer, 0, sizeof(buffer));
 
-	// Construct the Ethernet header
+#ifdef __FreeBSD__
+	(void)ifindex; // BPF writes don't use ifindex; frame contains all routing info
+#else
+	// Construct the sockaddr_ll for Linux AF_PACKET socket
 	struct sockaddr_ll socket_address;
 	socket_address.sll_family = AF_PACKET;
-	socket_address.sll_protocol = htons(ETH_P_ARP);
+	socket_address.sll_protocol = htons(PROTO_ARP);
 	socket_address.sll_ifindex = ifindex;
 	socket_address.sll_hatype = htons(ARPHRD_ETHER);
 	socket_address.sll_pkttype = PACKET_BROADCAST;
 	socket_address.sll_halen = MAC_LENGTH;
 	socket_address.sll_addr[6] = 0;
 	socket_address.sll_addr[7] = 0;
+#endif
 
-	struct ethhdr *send_req = (struct ethhdr *) buffer;
-	struct arp_header *arp_req = (struct arp_header *) (buffer + ETH2_HEADER_LEN);
+	// Portable Ethernet + ARP frame construction
+	struct eth_hdr *send_req = (struct eth_hdr *)buffer;
+	struct arp_header *arp_req = (struct arp_header *)(buffer + ETH2_HEADER_LEN);
 	ssize_t ret;
 
 	// Destination is the broadcast address
-	memset(send_req->h_dest, 0xff, MAC_LENGTH);
+	memset(send_req->dest, 0xff, MAC_LENGTH);
 
 	// Target MAC is zero (we don't know it)
 	memset(arp_req->target_mac, 0x00, MAC_LENGTH);
 
 	// Source MAC to our own MAC address
-	memcpy(send_req->h_source, thread_data->mac, MAC_LENGTH);
+	memcpy(send_req->source, thread_data->mac, MAC_LENGTH);
 	memcpy(arp_req->sender_mac, thread_data->mac, MAC_LENGTH);
+#ifndef __FreeBSD__
 	memcpy(socket_address.sll_addr, thread_data->mac, MAC_LENGTH);
+#endif
 
 	// Protocol type is ARP
-	send_req->h_proto = htons(ETH_P_ARP);
+	send_req->ethertype = htons(PROTO_ARP);
 
 	// Create ARP request
 	arp_req->hardware_type = htons(HW_TYPE);
-	arp_req->protocol_type = htons(ETH_P_IP);
+	arp_req->protocol_type = htons(PROTO_IP);
 	arp_req->hardware_len = MAC_LENGTH;
 	arp_req->protocol_len = IPV4_LENGTH;
 	arp_req->opcode = htons(ARP_REQUEST);
@@ -177,12 +212,16 @@ static int send_arps(const int fd, const int ifindex, struct thread_data *thread
 		memcpy(arp_req->target_ip, &dst_ip.s_addr, sizeof(dst_ip.s_addr));
 
 #ifdef DEBUG
-		printf("Sending ARP request for %s@%s\n", IP4STR(*dst_ip), iface);
+		printf("Sending ARP request for %s@%s\n", IP4STR(*dst_ip), thread_data->iface);
 #endif
 
 		// Send ARP request
-		ret = sendto(fd, buffer, 42, 0, (struct sockaddr *) &socket_address, sizeof(socket_address));
-		if (ret == -1)
+#ifdef __FreeBSD__
+		ret = write(fd, buffer, 42);
+#else
+		ret = sendto(fd, buffer, 42, 0, (struct sockaddr *)&socket_address, sizeof(socket_address));
+#endif
+		if(ret == -1)
 		{
 			err = errno;
 			thread_data->error = strerror(err);
@@ -202,8 +241,81 @@ out:
 
 static int create_arp_socket(const int ifindex, const char *iface, const char **error)
 {
+#ifdef __FreeBSD__
+	// FreeBSD: use BPF (Berkeley Packet Filter) instead of AF_PACKET.
+	// Open a /dev/bpf* device.  On FreeBSD >= 12 a single /dev/bpf can be
+	// cloned via open(); we try a few to be safe.
+	(void)ifindex; // BPF binds by interface name, not index
+	int arp_socket = -1;
+	char bpfpath[16];
+	for(int i = 0; i < 1024; i++)
+	{
+		snprintf(bpfpath, sizeof(bpfpath), "/dev/bpf%d", i);
+		arp_socket = open(bpfpath, O_RDWR);
+		if(arp_socket >= 0)
+			break;
+		if(errno != ENOENT && errno != EBUSY)
+			break;
+	}
+	if(arp_socket < 0)
+	{
+		*error = strerror(errno);
+		return -1;
+	}
+
+	// Bind the BPF device to the interface by name
+	struct ifreq bound_if;
+	memset(&bound_if, 0, sizeof(bound_if));
+	strncpy(bound_if.ifr_name, iface, IFNAMSIZ - 1);
+	if(ioctl(arp_socket, BIOCSETIF, &bound_if) < 0)
+	{
+		*error = strerror(errno);
+		close(arp_socket);
+		return -1;
+	}
+
+	// We supply the complete Ethernet header (src MAC etc.), so tell BPF not
+	// to add one of its own.
+	u_int hdrcmplt = 1;
+	if(ioctl(arp_socket, BIOCSHDRCMPLT, &hdrcmplt) < 0)
+	{
+		*error = strerror(errno);
+		close(arp_socket);
+		return -1;
+	}
+
+	// Deliver packets immediately rather than buffering full buffers.
+	u_int immediate = 1;
+	(void)ioctl(arp_socket, BIOCIMMEDIATE, &immediate); // best-effort
+
+	// Filter: pass only IPv4 ARP packets (ethertype 0x0806).
+	// BPF program:
+	//   ldh [12]        ; load ethertype at offset 12 (network byte order)
+	//   jeq 0x0806      ; if == ARP, jump to "return all"
+	//   ret #0          ; else drop (return 0)
+	//   ret #65535      ; return whole packet
+	struct bpf_insn filter[] = {
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PROTO_ARP, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+		BPF_STMT(BPF_RET | BPF_K, 65535),
+	};
+	struct bpf_program prog;
+	prog.bf_len = (u_int)(sizeof(filter) / sizeof(filter[0]));
+	prog.bf_insns = filter;
+	if(ioctl(arp_socket, BIOCSETF, &prog) < 0)
+	{
+		*error = strerror(errno);
+		close(arp_socket);
+		return -1;
+	}
+
+	// Note: we don't set SO_RCVTIMEO on the BPF fd; the read_arp() function
+	// will use select() with ARP_TIMEOUT instead.
+	return arp_socket;
+#else
 	// Create socket for ARP communications
-	const int arp_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+	const int arp_socket = socket(AF_PACKET, SOCK_RAW, htons(PROTO_ARP));
 	if(arp_socket < 0)
 	{
 		*error = strerror(errno);
@@ -218,7 +330,7 @@ static int create_arp_socket(const int ifindex, const char *iface, const char **
 	memset(&sll, 0, sizeof(struct sockaddr_ll));
 	sll.sll_family = AF_PACKET;
 	sll.sll_ifindex = ifindex;
-	if (bind(arp_socket, (struct sockaddr*) &sll, sizeof(struct sockaddr_ll)) < 0)
+	if(bind(arp_socket, (struct sockaddr*)&sll, sizeof(struct sockaddr_ll)) < 0)
 	{
 		*error = strerror(errno);
 #ifdef DEBUG
@@ -232,7 +344,7 @@ static int create_arp_socket(const int ifindex, const char *iface, const char **
 	struct timeval tv;
 	tv.tv_sec = ARP_TIMEOUT;
 	tv.tv_usec = 0;
-	if (setsockopt(arp_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+	if(setsockopt(arp_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
 	{
 		*error = strerror(errno);
 #ifdef DEBUG
@@ -243,6 +355,7 @@ static int create_arp_socket(const int ifindex, const char *iface, const char **
 	}
 
 	return arp_socket;
+#endif
 }
 
 static void add_result(struct in_addr *rcv_ip, unsigned char *sender_mac,
@@ -298,8 +411,61 @@ static ssize_t read_arp(const int fd, struct thread_data *thread_data)
 	// Read ARP responses
 	while(ret >= 0)
 	{
+#ifdef __FreeBSD__
+		// BPF: use select() for timeout, then read() one frame
+		fd_set read_fds;
+		FD_ZERO(&read_fds);
+		FD_SET(fd, &read_fds);
+		struct timeval tv;
+		tv.tv_sec = ARP_TIMEOUT;
+		tv.tv_usec = 0;
+		int sel = select(fd + 1, &read_fds, NULL, NULL, &tv);
+		if(sel <= 0)
+		{
+			// Timeout or select error
+			ret = 0;
+			break;
+		}
+		ret = read(fd, buffer, BUF_SIZE);
+		if(ret < 0)
+		{
+			thread_data->error = strerror(errno);
+			printf("read(): %s", thread_data->error);
+			break;
+		}
+		if(ret == 0)
+		{
+			// EOF (shouldn't happen on BPF)
+			continue;
+		}
+
+		// BPF returns frames with a header.  Skip it.
+		struct bpf_hdr *bh = (struct bpf_hdr *)buffer;
+		size_t caplen = bh->bh_caplen;
+		size_t hdrlen = bh->bh_hdrlen;
+		if(hdrlen > (size_t)ret || caplen > (size_t)ret - hdrlen)
+			continue; // malformed
+		unsigned char *frame = buffer + hdrlen;
+
+		struct eth_hdr *rcv_resp = (struct eth_hdr *)frame;
+		struct arp_header *arp_resp = (struct arp_header *)(frame + ETH2_HEADER_LEN);
+		if(caplen < ETH2_HEADER_LEN + sizeof(struct arp_header))
+		{
+#ifdef DEBUG
+			printf("read_arp packet too short");
+#endif
+			continue;
+		}
+		if(ntohs(rcv_resp->ethertype) != PROTO_ARP)
+		{
+#ifdef DEBUG
+			printf("Not an ARP packet");
+#endif
+			continue;
+		}
+#else
 		ret = recvfrom(fd, buffer, BUF_SIZE, 0, NULL, NULL);
-		if (ret == -1)
+		if(ret == -1)
 		{
 			if(errno == EAGAIN)
 			{
@@ -313,23 +479,25 @@ static ssize_t read_arp(const int fd, struct thread_data *thread_data)
 			printf("recvfrom(): %s", thread_data->error);
 			break;
 		}
-		struct ethhdr *rcv_resp = (struct ethhdr *) buffer;
-		struct arp_header *arp_resp = (struct arp_header *) (buffer + ETH2_HEADER_LEN);
-		if ((size_t)ret < ETH2_HEADER_LEN + sizeof(struct arp_header))
+		struct eth_hdr *rcv_resp = (struct eth_hdr *)buffer;
+		struct arp_header *arp_resp = (struct arp_header *)(buffer + ETH2_HEADER_LEN);
+		if((size_t)ret < ETH2_HEADER_LEN + sizeof(struct arp_header))
 		{
 #ifdef DEBUG
 			printf("read_arp packet too short");
 #endif
 			continue;
 		}
-		if (ntohs(rcv_resp->h_proto) != PROTO_ARP)
+		if(ntohs(rcv_resp->ethertype) != PROTO_ARP)
 		{
 #ifdef DEBUG
 			printf("Not an ARP packet");
 #endif
 			continue;
 		}
-		if (ntohs(arp_resp->opcode) != ARP_REPLY)
+#endif // __FreeBSD__ (read path)
+
+		if(ntohs(arp_resp->opcode) != ARP_REPLY)
 		{
 #ifdef DEBUG
 			printf("Not an ARP reply");
@@ -392,7 +560,7 @@ static void *arp_scan_iface(void *args)
 	const char *iface = thread_data->iface;
 
 	// Set interface name as thread name
-	prctl(PR_SET_NAME, iface, 0, 0, 0);
+	FTL_set_thread_name(iface);
 
 	// Get interface netmask
 	memcpy(&thread_data->mask, ifa->ifa_netmask, sizeof(thread_data->mask));

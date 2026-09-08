@@ -14,6 +14,18 @@
 #include "webserver/cJSON/cJSON.h"
 #include "webserver/json_macros.h"
 
+#ifdef __FreeBSD__
+// FreeBSD replacements for Linux netlink:
+// - getifaddrs() provides interface list, addresses, flags, MTU, MAC
+// - PF_ROUTE socket provides routing table (default gateway)
+// - sysctl NET_RT_DUMP provides ARP/NDP neighbor cache
+#include <sys/socket.h>      // socket(), PF_ROUTE
+#include <net/if.h>          // getifaddrs(), if_nametoindex(), IF_NAMESIZE
+#include <net/if_dl.h>       // struct sockaddr_dl for MAC addresses
+#include <net/route.h>       // struct rt_msghdr for route socket
+#include <netinet/in.h>      // struct sockaddr_in, in6
+#include <ifaddrs.h>         // getifaddrs(), freeifaddrs()
+#else
 #include <linux/rtnetlink.h>
 // IFF_UP, etc.
 #include <net/if.h>
@@ -21,6 +33,7 @@
 #include <linux/if_addr.h>
 #ifndef _NET_IF_ARP_H
 #include <linux/if_arp.h>
+#endif
 #endif
 
 bool nlroutes(cJSON *routes, const bool detailed);
@@ -49,12 +62,5 @@ struct flag_names {
 	uint32_t flag;
 	const char *name;
 };
-
-// Manually taken from kernel source code in include/net/ipv6.h
-#define	IFA_GLOBAL	0x0000U
-#define	IFA_HOST	0x0010U
-#define	IFA_LINK	0x0020U
-#define	IFA_SITE	0x0040U
-#define IFA_COMPATv4	0x0080U
 
 #endif // NETLINK_H
