@@ -15,12 +15,31 @@
 
 // ioctl()
 #include <sys/ioctl.h>
-// RTC
+// RTC -- Linux only; FreeBSD has no equivalent user-space RTC device interface,
+// so the whole body of this file is Linux-specific (see __FreeBSD__ branch in
+// ntp_sync_rtc() below).
+#ifndef __FreeBSD__
 #include <linux/rtc.h>
+#endif
 // O_WRONLY
 #include <fcntl.h>
 // struct config
 #include "config/config.h"
+
+#ifdef __FreeBSD__
+// FreeBSD has no Linux-style /dev/rtc* device and no <linux/rtc.h> interface to
+// write the hardware clock. Hardware-clock persistence across reboots is handled
+// by the kernel and adjkerntz rather than by a user-space RTC driver, so there is
+// nothing for FTL to do here. Report that RTC sync is unsupported and succeed
+// (the caller, ntp/client.c, ignores the return value, so this must not fail the
+// NTP sync itself).
+bool ntp_sync_rtc(void)
+{
+	log_debug(DEBUG_NTP, "RTC sync not supported on FreeBSD (no /dev/rtc interface)");
+	return true;
+}
+
+#else /* !__FreeBSD__ */
 
 // List of RTC devices from
 // https://github.com/util-linux/util-linux/blob/41e7686c9ad1ea7892b9d8941c266869bf6a28dd/sys-utils/hwclock-rtc.c#L85-L93
@@ -298,3 +317,5 @@ bool ntp_sync_rtc(void)
 
 	return true;
 }
+
+#endif /* !__FreeBSD__ */

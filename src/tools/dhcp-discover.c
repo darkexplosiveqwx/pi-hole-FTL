@@ -40,6 +40,13 @@
 // get_secure_randomness()
 #include "config/password.h"
 
+#ifdef __FreeBSD__
+// getifaddrs()/freeifaddrs() for reading the link-level (MAC) address
+#include <ifaddrs.h>
+// struct sockaddr_dl / LLADDR() - link-level address access
+#include <net/if_dl.h>
+#endif
+
 // IP4STR() formats into a single static buffer shared by all callers, so
 // concurrent interface threads would overwrite each other's address. Format
 // into a caller-provided buffer instead.
@@ -82,11 +89,17 @@ extern const struct opttab_t {
 static int create_dhcp_socket(const char *iname)
 {
 	struct sockaddr_in dhcp_socket;
+#ifndef __FreeBSD__
+	// Linux-only: used solely for the SO_BINDTODEVICE option below, which has
+	// no FreeBSD equivalent (FreeBSD has no interface-bound socket option).
 	struct ifreq interface;
+#endif
 	int flag = 1;
 
 	// Set up the address we're going to bind to (we will listen on any address).
+#ifndef __FreeBSD__
 	memset(&interface, 0, sizeof(interface));
+#endif
 	memset(&dhcp_socket, 0, sizeof(dhcp_socket));
 	dhcp_socket.sin_family = AF_INET;
 	dhcp_socket.sin_port = htons(DHCP_CLIENT_PORT);
@@ -127,7 +140,9 @@ static int create_dhcp_socket(const char *iname)
 		return -1;
 	}
 
-	// bind socket to interface
+	// bind socket to interface.  FreeBSD has no SO_BINDTODEVICE; the socket is
+	// bound to INADDR_ANY below, which is sufficient for DHCP discovery.
+#ifndef __FreeBSD__
 	strncpy(interface.ifr_ifrn.ifrn_name, iname, IFNAMSIZ-1);
 	if(setsockopt(sock,SOL_SOCKET, SO_BINDTODEVICE, (char *)&interface, sizeof(interface)) < 0)
 	{
@@ -138,6 +153,7 @@ static int create_dhcp_socket(const char *iname)
 		close(sock);
 		return -1;
 	}
+#endif
 
 	// bind the socket
 	if(bind(sock, (struct sockaddr *)&dhcp_socket, sizeof(dhcp_socket)) < 0)
@@ -156,6 +172,40 @@ static int create_dhcp_socket(const char *iname)
 // determines hardware address on client machine
 int get_hardware_address(const int sock, const char *iname, unsigned char *mac)
 {
+#ifdef __FreeBSD__
+	// FreeBSD has no SIOCGIFHWADDR ioctl; the link-level (MAC) address of a
+	// named interface is obtained by walking getifaddrs() and selecting the
+	// AF_LINK entry for the interface, whose sockaddr_dl carries the address.
+	(void)sock;
+	struct ifaddrs *ifap = NULL, *ifa;
+	if(getifaddrs(&ifap) != 0)
+	{
+		printf(" Error: Could not get hardware address of interface %s: %s\n", iname, strerror(errno));
+		return false;
+	}
+
+	bool found = false;
+	for(ifa = ifap; ifa != NULL; ifa = ifa->ifa_next)
+	{
+		if(ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK)
+			continue;
+		if(strcmp(ifa->ifa_name, iname) != 0)
+			continue;
+
+		const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)ifa->ifa_addr;
+		if(sdl->sdl_alen != 6)
+			break;
+		memcpy(&mac[0], LLADDR(sdl), 6);
+		found = true;
+		break;
+	}
+	freeifaddrs(ifap);
+	if(!found)
+	{
+		printf(" Error: Could not get hardware address of interface %s\n", iname);
+		return false;
+	}
+#else
 	struct ifreq ifr;
 	strncpy((char *)&ifr.ifr_name, iname, sizeof(ifr.ifr_name)-1);
 
@@ -167,6 +217,7 @@ int get_hardware_address(const int sock, const char *iname, unsigned char *mac)
 		return false;
 	}
 	memcpy(&mac[0], &ifr.ifr_hwaddr.sa_data, 6);
+#endif
 #ifdef DEBUG
 	start_lock();
 	printf("Hardware address of this interface: ");
@@ -260,7 +311,11 @@ static bool send_dhcp_discover(const int sock, const uint32_t xid, const char *i
 		// which is not helpful at all so we substitute a more
 		// meaningful error message for ENOKEY returned by wireguard interfaces
 		// (see https://www.wireguard.com/papers/wireguard.pdf, page 5)
+#if defined(ENOKEY)
 		const char *error = errno == ENOKEY ? "No route to host (no such peer available)" : strerror(errno);
+#else
+		const char *error = strerror(errno);
+#endif
 		start_lock();
 		printf("Error: Could not send DHCPDISCOVER to %s@%s: %s\n",
 		              IP4STR(target.sin_addr), iface, error);
@@ -698,11 +753,11 @@ static void *dhcp_discover_iface_v4(void *args)
 	sprintf(thread_name, "%s-v4", tdata->iface);
 
 	// Set interface name as thread name
-	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
+	FTL_set_thread_name(thread_name);
 	free(thread_name);
 
 	// Set interface name as thread name
-	prctl(PR_SET_NAME, tdata->iface, 0, 0, 0);
+	FTL_set_thread_name(tdata->iface);
 
 	// create socket for DHCP communications
 	const int dhcp_socket = create_dhcp_socket(tdata->iface);
@@ -747,7 +802,7 @@ static void *dhcp_discover_iface_v6(void *args)
 	sprintf(thread_name, "%s-v6", tdata->iface);
 
 	// Set interface name as thread name
-	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
+	FTL_set_thread_name(thread_name);
 	free(thread_name);
 
 	// Perform the same scan for DHCPv6

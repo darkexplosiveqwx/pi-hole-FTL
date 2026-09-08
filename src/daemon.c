@@ -22,8 +22,10 @@
 #include <sys/utsname.h>
 // killed
 #include "signals.h"
-// sysinfo()
+// sysinfo(); get_nprocs()/get_nprocs_conf() are provided via FTL.h on FreeBSD
+#ifndef __FreeBSD__
 #include <sys/sysinfo.h>
+#endif
 #include <errno.h>
 // getprio(), setprio()
 #include <sys/resource.h>
@@ -242,8 +244,16 @@ const char *hostname(void)
 
 			// Only set domain name if node name is not empty: the
 			// kernel replies with '(none)' in this case.
+#ifdef __FreeBSD__
+			// FreeBSD's struct utsname has no domainname member; get the
+			// domain via getdomainname() instead
+			char domain[HOSTNAMESIZE] = { 0 };
+			if(getdomainname(domain, HOSTNAMESIZE) == 0)
+				strncpy(dname, domain, HOSTNAMESIZE);
+#else
 			if(!(buf.domainname[0] == '(' && strncmp(buf.domainname, "(none)", 6) == 0))
 				strncpy(dname, buf.domainname, HOSTNAMESIZE);
+#endif
 		}
 		nodename[HOSTNAMESIZE - 1] = '\0';
 		dname[HOSTNAMESIZE - 1] = '\0';
@@ -267,11 +277,20 @@ void delay_startup(void)
 		return;
 
 	// Get uptime of system
+#ifdef __FreeBSD__
+	// FreeBSD has no sysinfo(); CLOCK_UPTIME returns the time since boot
+	struct timespec ts = { 0 };
+	bool uptime_ok = (clock_gettime(CLOCK_UPTIME, &ts) == 0);
+	const long uptime = uptime_ok ? (long)ts.tv_sec : -1;
+#else
 	struct sysinfo info = { 0 };
-	if(sysinfo(&info) == 0)
+	const bool uptime_ok = (sysinfo(&info) == 0);
+	const long uptime = uptime_ok ? (long)info.uptime : -1;
+#endif
+	if(uptime_ok)
 	{
 		// Exit early if system has already been running for a while
-		if(info.uptime > DELAY_UPTIME)
+		if(uptime > DELAY_UPTIME)
 		{
 			log_info("Not sleeping as system has finished booting");
 			return;
@@ -280,7 +299,7 @@ void delay_startup(void)
 	else
 	{
 		// Log error but continue
-		log_err("Unable to obtain sysinfo: %s (%i)", strerror(errno), errno);
+		log_err("Unable to obtain system uptime: %s (%i)", strerror(errno), errno);
 	}
 
 	// Sleep if requested by DELAY_STARTUP
@@ -302,12 +321,16 @@ bool __attribute__ ((const)) is_fork(const pid_t mpid, const pid_t pid)
 
 pid_t FTL_gettid(void)
 {
-#ifdef SYS_gettid
+#ifdef __FreeBSD__
+	// FreeBSD has no SYS_gettid syscall; the native way to get the current
+	// thread identifier is pthread_getthreadid_np().
+	return (pid_t)pthread_getthreadid_np();
+#elif defined(SYS_gettid)
 	return (pid_t)syscall(SYS_gettid);
 #else
 #warning SYS_gettid is not available on this system
 	return -1;
-#endif // SYS_gettid
+#endif // __FreeBSD__ / SYS_gettid
 }
 
 static void terminate_threads(void)
@@ -544,6 +567,30 @@ ssize_t getrandom_fallback(void *buf, size_t buflen, unsigned int flags)
 
 bool ipv6_enabled(void)
 {
+#ifdef __FreeBSD__
+	// FreeBSD has no /proc or /sys virtual files to inspect. The most reliable
+	// way to tell whether IPv6 is actually in use is to look for an AF_INET6
+	// address on a non-loopback interface (mirrors the Linux fallback below
+	// that checks /proc/net/if_inet6).
+	struct ifaddrs *ifaddr = NULL;
+	if(getifaddrs(&ifaddr) != 0)
+		return true; // cannot determine; assume IPv6 is enabled
+
+	bool ipv6_in_use = false;
+	for(const struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+	{
+		if(ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET6)
+			continue;
+		// Ignore the loopback address (::1)
+		const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6 *)ifa->ifa_addr;
+		if(IN6_IS_ADDR_LOOPBACK(&addr6->sin6_addr))
+			continue;
+		ipv6_in_use = true;
+		break;
+	}
+	freeifaddrs(ifaddr);
+	return ipv6_in_use;
+#else
 	// First we check a few virtual system files to see if IPv6 is disabled
 	const char *files[] = {
 		"/sys/module/ipv6/parameters/disable", // GRUB - ipv6.disable=1
@@ -588,6 +635,7 @@ bool ipv6_enabled(void)
 	// else: IPv6 is not obviously disabled and there is at least one
 	// IPv6-capable interface
 	return true;
+#endif // __FreeBSD__
 }
 
 void init_locale(void)

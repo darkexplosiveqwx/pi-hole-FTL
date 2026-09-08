@@ -12,8 +12,20 @@
 
 #include <stdbool.h>
 #include <sys/stat.h>
-// setmntent()
+// setmntent()/get_filesystem_details() return a struct mntent. FreeBSD ships
+// no <mntent.h>, so provide a minimal compatible definition there.
+#ifndef __FreeBSD__
 #include <mntent.h>
+#else
+struct mntent {
+	char *mnt_fsname; // device or server for the filesystem
+	char *mnt_dir;    // directory mounted on
+	char *mnt_type;   // type of filesystem
+	char *mnt_opts;   // comma-separated options for the fs
+	int   mnt_freq;   // dump frequency (in days)
+	int   mnt_passno; // pass number for fsck
+};
+#endif
 // SHA256_DIGEST_SIZE
 #include <nettle/sha2.h>
 // getpwuid()

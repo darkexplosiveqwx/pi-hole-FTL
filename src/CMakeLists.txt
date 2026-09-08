@@ -387,7 +387,25 @@ else()
     message(WARNING "libunistring not found, IDN support will be disabled")
 endif()
 
-target_link_libraries(pihole-FTL rt Threads::Threads ${LIBHOGWEED} ${LIBGMP} ${LIBNETTLE} ${LIBIDN2} ${LIBUNISTRING})
+# Link only the optional libraries that were actually found. Passing an
+# empty/NOTFOUND result to target_link_libraries() breaks the build on any
+# platform (here especially: FreeBSD) where one of these is absent, since the
+# link line then contains a dangling "<var>-NOTFOUND" path. Ordered so
+# dependencies precede dependents: gmp is needed by hogweed, unistring by idn2.
+set(FTL_OPTIONAL_LIBS "")
+foreach(_lib
+        LIBGMP
+        LIBUNISTRING
+        LIBHOGWEED
+        LIBIDN2
+        LIBNETTLE)
+    if(${_lib})
+        list(APPEND FTL_OPTIONAL_LIBS ${${_lib}})
+    endif()
+endforeach()
+unset(_lib)
+
+target_link_libraries(pihole-FTL rt Threads::Threads ${FTL_OPTIONAL_LIBS})
 
 if(LUA_DL STREQUAL "true")
     find_library(LIBDL dl)
@@ -674,8 +692,12 @@ add_custom_command(TARGET pihole-FTL POST_BUILD COMMENT "Appending sha256sum to 
 install(TARGETS pihole-FTL
         RUNTIME DESTINATION bin
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+# FreeBSD has no file capabilities (setcap): the daemon must run as root to
+# obtain the privileges that Linux grants via the CAP_* capabilities below.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
 find_program(SETCAP setcap)
 # After installing the binary, we set the capabilities on the binary ...
 install(CODE "execute_process(COMMAND ${SETCAP} CAP_NET_BIND_SERVICE,CAP_NET_RAW,CAP_NET_ADMIN,CAP_SYS_NICE,CAP_CHOWN,CAP_SYS_TIME+eip \${CMAKE_INSTALL_PREFIX}/bin/pihole-FTL)")
+endif()
 # ... and verify the binary integrity
 install(CODE "execute_process(COMMAND \${CMAKE_INSTALL_PREFIX}/bin/pihole-FTL verify)")

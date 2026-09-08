@@ -36,6 +36,19 @@
 // struct config
 #include "config/config.h"
 
+#ifdef __FreeBSD__
+// FreeBSD-native replacements for the Linux /proc interfaces below:
+// - sysctl KERN_PROC_PATHNAME (self / proc) replaces /proc/self/exe
+// - dl_iterate_phdr() builds the memory-map snapshot that /proc/self/maps
+//   provides on Linux (declared in <sys/link_elf.h>, not <dlfcn.h>)
+// - struct kinfo_proc via sysctl KERN_PROC_PID replaces /proc/<pid>/cmdline
+//   and /proc/self/status (TracerPid -> ki_flag & P_TRACED)
+#include <sys/sysctl.h>   // sysctlbyname() / sysctl() - executable path & kinfo_proc
+#include <sys/link_elf.h> // dl_iterate_phdr() - build the mapping snapshot
+#include <sys/user.h>     // struct kinfo_proc (process details)
+#include <sys/proc.h>     // P_TRACED - debugger detection flag
+#endif
+
 #define BINARY_NAME "pihole-FTL"
 
 volatile sig_atomic_t killed = 0;
@@ -80,12 +93,21 @@ extern const char __ehdr_start;
 void init_backtrace(const char *argv0)
 {
 #if defined(USE_UNWIND)
-	// /proc/self/exe gives the canonical absolute path even when argv[0] is
-	// a relative path, a bare binary name, or a symlink.
+	// Path of the running executable. On Linux /proc/self/exe gives the
+	// canonical absolute path even when argv[0] is a relative path, a bare
+	// binary name, or a symlink. FreeBSD has no /proc by default, so read the
+	// equivalent via the "kern.proc.pathname" sysctl.
+#ifdef __FreeBSD__
+	size_t pathlen = sizeof(bin_path);
+	if(sysctlbyname("kern.proc.pathname", bin_path, &pathlen, NULL, 0) != 0)
+		bin_path[0] = '\0';
+	else if(argv0 != NULL)
+#else
 	ssize_t len = readlink("/proc/self/exe", bin_path, sizeof(bin_path) - 1u);
 	if(len > 0)
 		bin_path[len] = '\0';
 	else if(argv0 != NULL)
+#endif
 	{
 		strncpy(bin_path, argv0, sizeof(bin_path) - 1u);
 		bin_path[sizeof(bin_path) - 1u] = '\0';
@@ -182,6 +204,9 @@ static bool parse_hex(const char **pp, uintptr_t *out)
 	return true;
 }
 
+// FreeBSD: only the Linux /proc/self/maps parser below needs this, so it is
+// compiled out to avoid an unused-function warning against -Werror.
+#ifndef __FreeBSD__
 // Parse one "/proc/self/maps" line ("start-end perms ...") into snap.
 // Manual hex/character parsing keeps this free of stdio and sscanf, neither
 // of which is async-signal-safe.
@@ -207,15 +232,47 @@ static void parse_maps_line(const char *line, struct maps_snapshot *snap)
 	e->readable = (p[0] == 'r');
 	e->executable = (p[2] == 'x');
 }
+#endif
 
-// Capture all process memory mappings into snap using raw open()/read()/close()
-// so this snapshot path avoids non-async-signal-safe stdio (fopen/fgets) - that
-// would risk a deadlock or secondary crash if the fault happened while libc held
-// an internal lock.  Taken once per unwind instead of per frame.
+// FreeBSD: dl_iterate_phdr() callback.  Adds each executable PT_LOAD segment
+// of a loaded object as a mapping entry.  The segment's runtime start/end are
+// dlpi_addr (the object's load base) plus the program-header p_vaddr/p_memsz.
+// Executable segments are implicitly readable on ELF.
+#ifdef __FreeBSD__
+static int map_snapshot_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+	struct maps_snapshot *snap = data;
+	(void)size;
+	for(int i = 0; i < info->dlpi_phnum && snap->count < MAPS_MAX_ENTRIES; i++)
+	{
+		const Elf_Phdr *ph = &info->dlpi_phdr[i];
+		if(ph->p_type != PT_LOAD)
+			continue;
+		struct map_entry *e = &snap->entries[snap->count++];
+		e->start = (uintptr_t)info->dlpi_addr + ph->p_vaddr;
+		e->end = e->start + ph->p_memsz;
+		e->readable = true;  // PT_LOAD implies readable
+		e->executable = (ph->p_flags & PF_X) != 0;
+	}
+	return 0;
+}
+#endif
+
+// Capture all process memory mappings into snap. On Linux this uses raw
+// open()/read()/close() on /proc/self/maps so the snapshot path avoids
+// non-async-signal-safe stdio (fopen/fgets) - that would risk a deadlock or
+// secondary crash if the fault happened while libc held an internal lock.
+// Taken once per unwind instead of per frame. FreeBSD has no /proc by default,
+// so the equivalent mapping set is walked from the dynamic linker's program
+// headers via dl_iterate_phdr(): each PT_LOAD describes one executable mapping.
 static void capture_maps_snapshot(struct maps_snapshot *snap)
 {
 	snap->count = 0;
 
+#ifdef __FreeBSD__
+	// http://pubs.opengroup.org/onlinepubs/009695399/functions/dl_iterate_phdr.html
+	dl_iterate_phdr(map_snapshot_cb, snap);
+#else
 	const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
 	if(fd < 0)
 		return;
@@ -255,6 +312,7 @@ static void capture_maps_snapshot(struct maps_snapshot *snap)
 	}
 
 	close(fd);
+#endif // __FreeBSD__ (capture_maps_snapshot)
 }
 
 // True when [addr, addr+bytes) is inside a readable mapping of the snapshot.
@@ -305,11 +363,23 @@ static int collect_from_signal_context(void **frames, const int max_frames, void
 	uintptr_t fp = 0;
 
 #if defined(__x86_64__)
+#ifdef __FreeBSD__
+	// FreeBSD exposes the machine context as named registers, not a gregs[]
+	// array: RIP/RBP live in mcontext.mc_rip / mcontext.mc_rbp.
+	ip = (uintptr_t)uc->uc_mcontext.mc_rip;
+	fp = (uintptr_t)uc->uc_mcontext.mc_rbp;
+#else
 	ip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
 	fp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+#endif
 #elif defined(__aarch64__)
+#ifdef __FreeBSD__
+	ip = (uintptr_t)uc->uc_mcontext.mc_gpregs.gp_elr;
+	fp = (uintptr_t)uc->uc_mcontext.mc_gpregs.gp_x[29];
+#else
 	ip = (uintptr_t)uc->uc_mcontext.pc;
 	fp = (uintptr_t)uc->uc_mcontext.regs[29];
+#endif
 #else
 	(void)uc;
 	return 0;
@@ -439,13 +509,52 @@ static bool maps_line_name_for_addr(const char *line, const uintptr_t a,
 	return true;
 }
 
+// FreeBSD: locate the loaded object whose address range contains `a` and copy
+// the basename of its dlpi_name into buf.  No /proc needed; walks the dynamic
+// linker's program headers instead.
+#ifdef __FreeBSD__
+struct mapping_name_ctx {
+	uintptr_t a;
+	char *buf;
+	size_t buflen;
+};
+static int mapping_name_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+	struct mapping_name_ctx *ctx = data;
+	(void)size;
+	for(int i = 0; i < info->dlpi_phnum; i++)
+	{
+		const Elf_Phdr *ph = &info->dlpi_phdr[i];
+		if(ph->p_type != PT_LOAD)
+			continue;
+		const uintptr_t start = (uintptr_t)info->dlpi_addr + ph->p_vaddr;
+		const uintptr_t end = start + ph->p_memsz;
+		if(ctx->a >= start && ctx->a < end)
+		{
+			const char *name = info->dlpi_name;
+			if(name != NULL && name[0] != '\0')
+			{
+				const char *base = strrchr(name, '/');
+				name = base ? base + 1 : name;
+				strncpy(ctx->buf, name, ctx->buflen - 1u);
+				ctx->buf[ctx->buflen - 1u] = '\0';
+			}
+			// Stop at the first (innermost) containing mapping.
+			return 1;
+		}
+	}
+	return 0;
+}
+#endif
+
 // Look up which /proc/self/maps entry contains addr and copy the basename
 // of the mapped file (e.g. "libc.so.6", "[vdso]") into buf.  buf is left empty
 // when the address is not found or has no path.  Uses raw open()/read() and
 // manual parsing to avoid the stdio (fopen/fgets/sscanf) that the rest of this
 // last-resort fallback would otherwise pull into the crash handler.  It still
 // calls a few plain string helpers (strrchr/strncpy/strcmp), so it is not
-// fully async-signal-safe.
+// fully async-signal-safe.  On FreeBSD the same result comes from
+// dl_iterate_phdr() walking the loaded objects' PT_LOAD segments.
 static void find_mapping_name(const void *addr, char *buf, const size_t buflen)
 {
 	if(buflen == 0u)
@@ -453,6 +562,12 @@ static void find_mapping_name(const void *addr, char *buf, const size_t buflen)
 	// Honor the "left empty" contract for every early-return path below so
 	// callers never observe stale buffer contents.
 	buf[0] = '\0';
+
+#ifdef __FreeBSD__
+	struct mapping_name_ctx ctx = { (uintptr_t)addr, buf, buflen };
+	dl_iterate_phdr(mapping_name_cb, &ctx);
+	return;
+#endif
 
 	const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
 	if(fd < 0)
@@ -868,7 +983,7 @@ static void terminate(void);
 // The name is stored in the buffer as well as returned for convenience
 static char * __attribute__ ((nonnull (1))) getthread_name(char buffer[16])
 {
-	prctl(PR_GET_NAME, buffer, 0, 0, 0);
+	FTL_get_thread_name(buffer, 16);
 	return buffer;
 }
 
@@ -1266,6 +1381,18 @@ void log_sigterm_info(void)
 
 	// Get name of the process that sent the terminating signal
 	char kill_name[256] = { 0 };
+#ifdef __FreeBSD__
+	// FreeBSD has no /proc by default; fetch the process name via the
+	// KERN_PROC_PID sysctl instead (kinfo_proc.ki_comm).
+	struct kinfo_proc kinfo;
+	size_t klen = sizeof(kinfo);
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)kill_pid };
+	if(sysctl(mib, 4, &kinfo, &klen, NULL, 0) == 0 && klen == sizeof(kinfo) &&
+	   kinfo.ki_pid == kill_pid && kinfo.ki_comm[0] != '\0')
+		strncpy(kill_name, kinfo.ki_comm, sizeof(kill_name));
+	else
+		strcpy(kill_name, "N/A");
+#else
 	char kill_exe [256] = { 0 };
 	snprintf(kill_exe, sizeof(kill_exe), "/proc/%ld/cmdline", (long int)kill_pid);
 	FILE *fp = fopen(kill_exe, "r");
@@ -1297,6 +1424,7 @@ void log_sigterm_info(void)
 	}
 	else
 		strcpy(kill_name, "N/A");
+#endif
 
 	// Get username of the process that sent the terminating signal
 	char kill_user[256] = { 0 };
@@ -1527,15 +1655,28 @@ void restart_ftl(const char *reason)
 /**
  * @brief Checks if the current process is being debugged.
  *
- * This function reads the /proc/self/status file to determine if the current
+ * On Linux this reads the /proc/self/status file to determine if the current
  * process is being debugged by looking for the TracerPid field. If the field
  * is found and has a non-zero value, it indicates that the process is being
- * debugged.
+ * debugged.  FreeBSD has no /proc by default, so the P_TRACED process flag is
+ * read via the KERN_PROC_PID sysctl instead.
  *
  * @return The PID of the debugger if the process is being debugged, otherwise 0.
  */
 pid_t debugger(void)
 {
+#ifdef __FreeBSD__
+	// FreeBSD: a traced process has the P_TRACED flag set in kinfo_proc.ki_flag.
+	// There is no per-debugger PID equivalent to Linux's TracerPid, so return a
+	// boolean (1 = traced) which is all callers branch on.
+	struct kinfo_proc kinfo;
+	size_t klen = sizeof(kinfo);
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid() };
+	if(sysctl(mib, 4, &kinfo, &klen, NULL, 0) == 0 && klen == sizeof(kinfo) &&
+	   (kinfo.ki_flag & P_TRACED) != 0)
+		return 1;
+	return 0;
+#else
 	FILE *status = fopen("/proc/self/status", "r");
 	if(status == NULL)
 	{
@@ -1556,4 +1697,5 @@ pid_t debugger(void)
 	}
 	fclose(status);
 	return 0;
+#endif // __FreeBSD__ (debugger)
 }

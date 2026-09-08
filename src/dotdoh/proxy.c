@@ -36,8 +36,14 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/prctl.h>
+// PR_SET_NAME is provided via FTL.h
+// sysinfo() and <sys/sysinfo.h> are Linux-specific; FreeBSD computes total
+// RAM from sysconf(3) instead.
+#ifdef __FreeBSD__
+#include <unistd.h> // sysconf
+#else
 #include <sys/sysinfo.h>
+#endif
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
@@ -133,11 +139,18 @@ static void compute_scale(int nupstreams)
 	if(k < POOLCONN_MIN) k = POOLCONN_MIN;
 	if(k > POOLCONN_MAX) k = POOLCONN_MAX;
 
+	unsigned long long total_ram = 0;
+#ifdef __FreeBSD__
+	// Total physical memory = number of pages * page size
+	total_ram = (unsigned long long)sysconf(_SC_PHYS_PAGES) * (unsigned long long)sysconf(_SC_PAGESIZE);
+#else
 	struct sysinfo si;
-	if(nupstreams > 0 && sysinfo(&si) == 0)
+	if(sysinfo(&si) == 0)
+		total_ram = (uint64_t)si.totalram * si.mem_unit;
+#endif
+	if(nupstreams > 0 && total_ram > 0)
 	{
-		const uint64_t ram = (uint64_t)si.totalram * si.mem_unit;
-		const uint64_t budget = (ram / 20u) / (170u * 1024u); // 5% / ~170 KiB
+		const uint64_t budget = (total_ram / 20u) / (170u * 1024u); // 5% / ~170 KiB
 		int kmax = (int)(budget / (uint64_t)nupstreams);
 		if(kmax < POOLCONN_MIN)
 			kmax = POOLCONN_MIN;
@@ -641,7 +654,7 @@ static void maybe_emit_summary(void)
 static void *worker_main(void *val)
 {
 	(void)val;
-	prctl(PR_SET_NAME, thread_names[DOTDOH], 0, 0, 0);
+	FTL_set_thread_name(thread_names[DOTDOH]);
 
 	struct pollfd fds[2 * DOTDOH_MAX_UPSTREAMS];
 	struct proxy_up *owner[2 * DOTDOH_MAX_UPSTREAMS];

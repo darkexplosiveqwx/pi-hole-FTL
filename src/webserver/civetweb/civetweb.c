@@ -193,6 +193,9 @@ mg_static_assert(sizeof(void *) >= sizeof(int), "data type size check");
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#if defined(__FreeBSD__)
+#include <pthread_np.h> /* pthread_getthreadid_np */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -882,6 +885,9 @@ typedef unsigned short int in_port_t;
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#if defined(__FreeBSD__)
+#include <pthread_np.h> /* pthread_setname_np()/pthread_getthreadid_np() */
+#endif
 #include <pwd.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -2889,6 +2895,10 @@ mg_set_thread_name(const char *name)
 #else
 	(void)pthread_setname_np(pthread_self(), threadName);
 #endif
+#elif defined(__FreeBSD__)
+	/* FreeBSD has no prctl(); use the POSIX naming calls instead.
+	 * pthread_setname_np() is available in libthr. */
+	(void)pthread_setname_np(pthread_self(), threadName);
 #elif defined(__linux__)
 	/* On Linux we can use the prctl function.
 	 * When building for Linux Standard Base (LSB) use
@@ -2899,7 +2909,12 @@ mg_set_thread_name(const char *name)
 #endif
 
 	// Pi-hole modification: Increase niceness of threads
+#if defined(__FreeBSD__)
+	/* FreeBSD has no gettid()/SYS_gettid; use pthread_getthreadid_np() instead. */
+	setpriority(PRIO_PROCESS, (id_t)pthread_getthreadid_np(), 5);
+#else
 	setpriority(PRIO_PROCESS, gettid(), 5);
+#endif
 }
 #else /* !defined(NO_THREAD_NAME) */
 static void

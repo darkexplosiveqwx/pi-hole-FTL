@@ -18,8 +18,10 @@
 #include "config/config.h"
 // log_web()
 #include "log.h"
-// get_nprocs()
+// get_nprocs() (provided via FTL.h on FreeBSD; <sys/sysinfo.h> is Linux-only)
+#ifndef __FreeBSD__
 #include <sys/sysinfo.h>
+#endif
 // file_readable()
 #include "files.h"
 // generate_certificate()
@@ -1362,7 +1364,7 @@ void *webserver_thread(void *val)
 {
 	(void)val;
 	// Set thread name
-	prctl(PR_SET_NAME, thread_names[WEBSERVER], 0, 0, 0);
+	FTL_set_thread_name(thread_names[WEBSERVER]);
 
 	// Initialize FTL HTTP server
 	http_init();

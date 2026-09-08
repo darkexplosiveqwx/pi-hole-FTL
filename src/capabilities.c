@@ -19,6 +19,27 @@
 #include "dotdoh/server.h"
 #include "log.h"
 
+#ifdef __FreeBSD__
+// On FreeBSD there are no Linux-style per-thread capabilities. Instead, a
+// process is either root (which may perform every privileged operation) or
+// unprivileged. The FTL capability checks are therefore mapped to a check for
+// effective uid 0, which is the only way FTL obtains these privileges here.
+// This file is still compiled on FreeBSD so that the call sites in
+// args.c, tools/*.c, ntp/client.c, config/cli.c, main.c etc. remain
+// unchanged and portable.
+
+bool check_capability(const unsigned int cap __attribute__((unused)))
+{
+	return geteuid() == 0;
+}
+
+bool check_capabilities(void)
+{
+	return check_capability(0);
+}
+
+#else /* !__FreeBSD__ */
+
 static const unsigned int capabilityIDs[]   = { CAP_CHOWN ,  CAP_DAC_OVERRIDE ,  CAP_DAC_READ_SEARCH ,  CAP_FOWNER ,  CAP_FSETID ,  CAP_KILL ,  CAP_SETGID ,  CAP_SETUID ,  CAP_SETPCAP ,  CAP_LINUX_IMMUTABLE ,  CAP_NET_BIND_SERVICE ,  CAP_NET_BROADCAST ,  CAP_NET_ADMIN ,  CAP_NET_RAW ,  CAP_IPC_LOCK ,  CAP_IPC_OWNER ,  CAP_SYS_MODULE ,  CAP_SYS_RAWIO ,  CAP_SYS_CHROOT ,  CAP_SYS_PTRACE ,  CAP_SYS_PACCT ,  CAP_SYS_ADMIN ,  CAP_SYS_BOOT ,  CAP_SYS_NICE ,  CAP_SYS_RESOURCE ,  CAP_SYS_TIME ,  CAP_SYS_TTY_CONFIG ,  CAP_MKNOD ,  CAP_LEASE ,  CAP_AUDIT_WRITE ,  CAP_AUDIT_CONTROL ,  CAP_SETFCAP };
 static const char*        capabilityNames[] = {"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP", "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER", "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE", "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE", "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD", "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL", "CAP_SETFCAP"};
 
@@ -218,3 +239,5 @@ bool check_capabilities(void)
 	// Return whether capabilities are all okay
 	return capabilities_okay;
 }
+
+#endif /* !__FreeBSD__ */

@@ -1232,6 +1232,24 @@ static bool realloc_shm(SharedMemory *sharedMemory, const size_t size1, const si
 		local_shm_counter++;
 	}
 
+#ifdef __FreeBSD__
+	// FreeBSD has no mremap(); unmap the old mapping and re-map the (already
+	// enlarged by ftlallocate() above) shared-memory object at a fresh
+	// address with the new size.
+	void *new_ptr = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	                     sharedMemory->fd, 0);
+	if(new_ptr == MAP_FAILED)
+	{
+		log_crit("realloc_shm(): mmap(%zu): Failed to remap \"%s\": %s",
+		         new_size, sharedMemory->name, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	if(munmap(sharedMemory->ptr, sharedMemory->size) != 0)
+	{
+		log_warn("realloc_shm(): munmap(%p, %zu) failed: %s",
+		         sharedMemory->ptr, sharedMemory->size, strerror(errno));
+	}
+#else
 	void *new_ptr = mremap(sharedMemory->ptr, sharedMemory->size, new_size, MREMAP_MAYMOVE);
 	if(new_ptr == MAP_FAILED)
 	{
@@ -1239,6 +1257,7 @@ static bool realloc_shm(SharedMemory *sharedMemory, const size_t size1, const si
 		         sharedMemory->ptr, sharedMemory->size, new_size, sharedMemory->name, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
+#endif
 
 	// Update how much memory FTL uses
 	// We add the difference between updated and previous size

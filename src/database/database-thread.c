@@ -151,7 +151,7 @@ static void log_used_memory(void)
 void *DB_thread(void *val)
 {
 	// Set thread name
-	prctl(PR_SET_NAME, thread_names[DB], 0, 0, 0);
+	FTL_set_thread_name(thread_names[DB]);
 
 	// Asynchronously import queries from the on-disk database
 	if(config.database.DBimport.v.b)

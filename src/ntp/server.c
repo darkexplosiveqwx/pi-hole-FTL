@@ -30,8 +30,8 @@
 #include <time.h>
 // pthread_create
 #include <pthread.h>
-// PR_SET_NAME
-#include <sys/prctl.h>
+// FTL_set_thread_name() (also pulls in <sys/prctl.h> on Linux)
+#include "FTL.h"
 // config struct
 #include "config/config.h"
 // log_ntp_message()
@@ -296,7 +296,7 @@ static void *ntp_bind_and_listen(void *param)
 {
 	// Set thread name
 	const unsigned int thread_id = param == 0 ? NTP_SERVER4 : NTP_SERVER6;
-	prctl(PR_SET_NAME, thread_names[thread_id], 0, 0, 0);
+	FTL_set_thread_name(thread_names[thread_id]);
 
   	// Create a socket
 	const int protocol = param == 0 ? AF_INET : AF_INET6;

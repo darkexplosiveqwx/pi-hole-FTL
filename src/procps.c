@@ -20,6 +20,15 @@
 // readPID()
 #include "daemon.h"
 
+#ifdef __FreeBSD__
+// struct kinfo_proc
+#include <sys/user.h>
+// sysctl(), CTL_KERN, KERN_PROC, CPUSTATES/CP_* come via sys/resource.h
+#include <sys/sysctl.h>
+// getrusage(), struct rusage, CPUSTATES, CP_USER/CP_NICE/CP_SYS
+#include <sys/resource.h>
+#endif
+
 #define PROCESS_NAME   "pihole-FTL"
 
 // This function tries to obtain the process name of a given PID
@@ -37,6 +46,42 @@ bool get_process_name(const pid_t pid, char name[PROC_PATH_SIZ])
 		return true;
 	}
 
+#ifdef __FreeBSD__
+	// There is no /proc on FreeBSD; consult the kernel process table
+	// instead.
+	// Preferred: KERN_PROC_PATHNAME returns the absolute path of the
+	// executable, from which we strip the directory portion.
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid };
+	char path[PATH_MAX] = { 0 };
+	size_t path_len = sizeof(path);
+	if(sysctl(mib, 4, path, &path_len, NULL, 0) == 0 && path_len > 0)
+	{
+		char *base = strrchr(path, '/');
+		base = (base != NULL) ? base + 1 : path;
+		if(base[0] != '\0')
+		{
+			strncpy(name, base, PROC_PATH_SIZ - 1);
+			name[PROC_PATH_SIZ - 1] = '\0';
+			return true;
+		}
+	}
+
+	// Fall back to the command name from the process table. This is not
+	// guaranteed to be fully correct (a process can change it via
+	// pthread_setname_np()), but it is better than nothing.
+	struct kinfo_proc info;
+	mib[2] = KERN_PROC_PID;
+	mib[3] = pid;
+	size_t len = sizeof(info);
+	if(sysctl(mib, 4, &info, &len, NULL, 0) == 0 && len > 0)
+	{
+		strncpy(name, info.ki_comm, PROC_PATH_SIZ - 1);
+		name[PROC_PATH_SIZ - 1] = '\0';
+		return true;
+	}
+
+	return false;
+#else
 	// Try to open comm file
 	char filename[sizeof("/proc/%d/exe") + sizeof(int)*3];
 	snprintf(filename, sizeof(filename), "/proc/%d/exe", pid);
@@ -73,6 +118,7 @@ bool get_process_name(const pid_t pid, char name[PROC_PATH_SIZ])
 	fclose(f);
 
 	return true;
+#endif
 }
 
 /**
@@ -119,6 +165,24 @@ static pid_t readPID(void)
  */
 static bool process_alive(const pid_t pid)
 {
+#ifdef __FreeBSD__
+	// Look the process up in the kernel process table. If the process is
+	// no longer present, the sysctl returns no data (or fails), meaning
+	// it is dead.
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+	struct kinfo_proc info;
+	size_t len = sizeof(info);
+	if(sysctl(mib, 4, &info, &len, NULL, 0) != 0 || len == 0)
+		return false;
+
+	// A zombie process is still present in the table but awaiting
+	// collection by its parent, so it is not considered running.
+	if(info.ki_stat == 'Z')
+		return false;
+
+	log_debug(DEBUG_SHMEM, "Process state: \"%c\"", info.ki_stat);
+	return true;
+#else
 	// Create /proc/<pid>/status filename
 	char filename[64] = { 0 };
 	snprintf(filename, sizeof(filename), "/proc/%d/status", pid);
@@ -158,6 +222,7 @@ static bool process_alive(const pid_t pid)
 
 	// Process is still alive if the running flag is still true
 	return running;
+#endif
 }
 
 // This function prints an info message about if another FTL process is already
@@ -209,6 +274,34 @@ bool another_FTL(void)
 
 bool getProcessMemory(struct proc_mem *mem, const unsigned long total_memory)
 {
+#ifdef __FreeBSD__
+	// Gather the current process' memory data from the kernel process
+	// table instead of /proc/self/status.
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+	struct kinfo_proc info;
+	size_t len = sizeof(info);
+	if(sysctl(mib, 4, &info, &len, NULL, 0) != 0 || len == 0)
+		return false;
+
+	const long page_size = sysconf(_SC_PAGESIZE);
+	if(page_size <= 0)
+		return false;
+
+	// Resident set size (pages -> bytes -> kB)
+	mem->VmRSS = (unsigned long)info.ki_rssize * page_size / 1024;
+	// Virtual memory size (ki_size is a byte count -> kB)
+	mem->VmSize = info.ki_size / 1024;
+	// FreeBSD does not expose peak RSS/virtual sizes; approximate them
+	// with the current sizes (best effort)
+	mem->VmHWM = mem->VmRSS;
+	mem->VmPeak = mem->VmSize;
+
+	mem->VmRSS_percent = 100.0f * mem->VmRSS / total_memory;
+	if(mem->VmRSS_percent > 99.9f)
+		mem->VmRSS_percent = 99.9f;
+
+	return true;
+#else
 	// Open /proc/self/status
 	FILE *file = fopen("/proc/self/status", "r");
 	if(file == NULL)
@@ -230,12 +323,49 @@ bool getProcessMemory(struct proc_mem *mem, const unsigned long total_memory)
 		mem->VmRSS_percent = 99.9f;
 
 	return true;
+#endif
 }
 
 // Get RAM information in units of kB
 // This is implemented similar to how free (procps) does it
 bool parse_proc_meminfo(struct proc_meminfo *mem)
 {
+#ifdef __FreeBSD__
+	// Gather physical memory and VM page counters via sysctls; FreeBSD has
+	// no /proc/meminfo.
+	uint64_t physmem = 0;
+	size_t len = sizeof(physmem);
+	if(sysctlbyname("hw.physmem", &physmem, &len, NULL, 0) != 0)
+		return false;
+
+	const long page_size = sysconf(_SC_PAGESIZE);
+	if(page_size <= 0)
+		return false;
+
+	uint64_t free_count = 0, inactive_count = 0, cache_count = 0;
+	len = sizeof(free_count);
+	sysctlbyname("vm.stats.vm.v_free_count", &free_count, &len, NULL, 0);
+	len = sizeof(inactive_count);
+	sysctlbyname("vm.stats.vm.v_inactive_count", &inactive_count, &len, NULL, 0);
+	len = sizeof(cache_count);
+	sysctlbyname("vm.stats.vm.v_cache_count", &cache_count, &len, NULL, 0);
+
+	mem->total  = physmem / 1024;
+	mem->mfree  = free_count * page_size / 1024;
+	mem->cached = cache_count * page_size / 1024;
+
+	// FreeBSD has no MemAvailable field; approximate the memory available
+	// without swapping as free + inactive + cache (all reclaimable).
+	mem->avail = (free_count + inactive_count + cache_count) * page_size / 1024;
+
+	// Compute the used memory
+	if(mem->total >= mem->mfree + mem->cached)
+		mem->used = mem->total - mem->mfree - mem->cached;
+	else
+		mem->used = mem->total - mem->mfree;
+
+	return true;
+#else
 	long page_cached = -1, buffers = -1, slab_reclaimable = -1;
 	FILE *meminfo = fopen("/proc/meminfo", "r");
 	if(meminfo == NULL)
@@ -269,6 +399,7 @@ bool parse_proc_meminfo(struct proc_meminfo *mem)
 
 	// Return success
 	return true;
+#endif
 }
 
 
@@ -280,6 +411,22 @@ bool parse_proc_meminfo(struct proc_meminfo *mem)
  */
 double parse_proc_stat(void)
 {
+#ifdef __FreeBSD__
+	// Read the cumulative CPU times from the kernel instead of /proc/stat.
+	// kern.cp_time is a long[CPUSTATES] of clock ticks spent in each state.
+	long cp_time[CPUSTATES] = { 0 };
+	size_t len = sizeof(cp_time);
+	if(sysctlbyname("kern.cp_time", cp_time, &len, NULL, 0) != 0)
+		return -1.0;
+
+	// kern.cp_time counts statement-clock ticks; convert to seconds.
+	// Summing user + nice + system matches the Linux /proc/stat semantics.
+	const long ticks = sysconf(_SC_CLK_TCK);
+	if(ticks <= 0)
+		return -1.0;
+
+	return (cp_time[CP_USER] + cp_time[CP_NICE] + cp_time[CP_SYS]) / (double)ticks;
+#else
 	FILE *statfile = fopen("/proc/stat", "r");
 	if(statfile == NULL)
 		return -1.0;
@@ -346,6 +493,7 @@ double parse_proc_stat(void)
 
 	const long ticks = sysconf(_SC_CLK_TCK);
 	return (user + nice + system) / (double)ticks;
+#endif
 }
 
 /**
@@ -363,6 +511,18 @@ double parse_proc_stat(void)
  */
 double parse_proc_self_stat(void)
 {
+#ifdef __FreeBSD__
+	// Use getrusage() which reports the cumulative (user + system) CPU time
+	// consumed by the current process; this is equivalent to reading utime
+	// and stime from /proc/self/stat on Linux.
+	struct rusage usage;
+	if(getrusage(RUSAGE_SELF, &usage) != 0)
+		return -1.0;
+
+	const double utime = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6;
+	const double stime = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+	return utime + stime;
+#else
 	// Open /proc/self/stat
 	FILE *file = fopen("/proc/self/stat", "r");
 	if(file == NULL)
@@ -383,6 +543,7 @@ double parse_proc_self_stat(void)
 		return -1.0;
 
 	return (utime + stime) / (double)ticks;
+#endif
 }
 
 /**
@@ -403,6 +564,35 @@ double parse_proc_self_stat(void)
  */
 pid_t search_proc(const char *name)
 {
+#ifdef __FreeBSD__
+	// Fetch the full kernel process table instead of iterating /proc.
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0;
+	if(sysctl(mib, 4, NULL, &len, NULL, 0) != 0)
+		return -1;
+
+	struct kinfo_proc *procs = calloc(1, len);
+	if(procs == NULL)
+		return -1;
+	if(sysctl(mib, 4, procs, &len, NULL, 0) != 0)
+	{
+		free(procs);
+		return -1;
+	}
+
+	const size_t nprocs = len / sizeof(struct kinfo_proc);
+	pid_t found = -1;
+	for(size_t i = 0; i < nprocs; i++)
+	{
+		if(strncmp(procs[i].ki_comm, name, PROC_PATH_SIZ) == 0)
+		{
+			found = procs[i].ki_pid;
+			break;
+		}
+	}
+	free(procs);
+	return found;
+#else
 	DIR *dir = opendir("/proc");
 	if(dir == NULL)
 		return -1;
@@ -440,4 +630,38 @@ pid_t search_proc(const char *name)
 	// No process found with the given name
 	closedir(dir);
 	return -1;
+#endif
+}
+
+/**
+ * @brief Returns the number of processes currently running on the system.
+ *
+ * @return The number of processes, or 0 if the count could not be determined.
+ */
+unsigned int count_processes(void)
+{
+#ifdef __FreeBSD__
+	// Count the entries in the kernel process table
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0;
+	if(sysctl(mib, 4, NULL, &len, NULL, 0) != 0)
+		return 0;
+
+	return len / sizeof(struct kinfo_proc);
+#else
+	// Count the numeric entries in /proc
+	DIR *dir = opendir("/proc");
+	if(dir == NULL)
+		return 0;
+
+	unsigned int count = 0;
+	struct dirent *entry;
+	while((entry = readdir(dir)) != NULL)
+	{
+		if(entry->d_type == DT_DIR && isdigit(entry->d_name[0]))
+			count++;
+	}
+	closedir(dir);
+	return count;
+#endif
 }

@@ -1460,7 +1460,7 @@ static void resolveUpstreams(const bool onlynew)
 void *DNSclient_thread(void *val)
 {
 	// Set thread name
-	prctl(PR_SET_NAME, thread_names[DNSclient], 0, 0, 0);
+	FTL_set_thread_name(thread_names[DNSclient]);
 
 	// Test struct sizes
 	if(!check_struct_sizes())

@@ -26,11 +26,19 @@
 #include <limits.h>
 // statvfs()
 #include <sys/statvfs.h>
+// getmntinfo(), struct statfs (FreeBSD)
+#ifdef __FreeBSD__
+#include <sys/mount.h>
+// sysctl(), KERN_PROC_PATHNAME
+#include <sys/sysctl.h>
+#endif
 // dirname()
 #include <libgen.h>
 // sendfile()
 #include <fcntl.h>
+#ifndef __FreeBSD__ // FreeBSD's sendfile() has a different signature
 #include <sys/sendfile.h>
+#endif
 // PRIu64
 #include <inttypes.h>
 //basename()
@@ -302,6 +310,42 @@ unsigned int get_path_usage(const char *path, char buffer[64])
 // Get the filesystem where the given path is located
 struct mntent *get_filesystem_details(const char *path)
 {
+#ifdef __FreeBSD__
+	// FreeBSD has no /proc/mounts or setmntent(); getmntinfo() returns a
+	// pointer to a static array of struct statfs that stays valid until the
+	// next call. We find the mount whose mountpoint is on the same device as
+	// the path and return a struct mntent pointing into that entry.
+	struct stat path_stat;
+	if(stat(path, &path_stat) != 0)
+		return NULL;
+
+	struct statfs *mounts = NULL;
+	const int count = getmntinfo(&mounts, MNT_NOWAIT);
+	if(count < 1)
+		return NULL;
+
+	static struct mntent ent = { 0 };
+	for(int i = 0; i < count; i++)
+	{
+		struct stat dev_stat;
+		if(stat(mounts[i].f_mntonname, &dev_stat) < 0)
+			continue;
+
+		if(dev_stat.st_dev == path_stat.st_dev)
+		{
+			// statfs fields are static buffers, safe to point at until the
+			// next getmntinfo() call
+			ent.mnt_fsname = mounts[i].f_mntfromname;
+			ent.mnt_dir    = mounts[i].f_mntonname;
+			ent.mnt_type   = mounts[i].f_fstypename;
+			ent.mnt_opts   = ""; // no options string in FreeBSD statfs
+			ent.mnt_freq   = 0;
+			ent.mnt_passno = 0;
+			return &ent;
+		}
+	}
+	return NULL;
+#else
 	// stat the file in question
 	struct stat path_stat;
 	stat(path, &path_stat);
@@ -336,6 +380,7 @@ struct mntent *get_filesystem_details(const char *path)
 	endmntent(file);
 
 	return found ? ent : NULL;
+#endif // __FreeBSD__
 }
 
 // Credits: https://stackoverflow.com/a/55410469
@@ -415,6 +460,45 @@ static int copy_file(const char *source, const char *destination)
 			close(input);
 			return -1;
 	}
+#ifdef __FreeBSD__
+	// FreeBSD's sendfile() has an incompatible signature, so use a plain
+	// read/write loop instead of the Linux kernel-space copy fallback
+	char buf[64 * 1024];
+	ssize_t bytesCopied = 0;
+	ssize_t n;
+	while((n = read(input, buf, sizeof(buf))) > 0)
+	{
+		const char *p = buf;
+		ssize_t towrite = n;
+		while(towrite > 0)
+		{
+			const ssize_t w = write(output, p, towrite);
+			if(w < 0)
+			{
+				if(errno == EINTR)
+					continue;
+				log_warn("copy_file(): Failed to copy \"%s\" to \"%s\": %s", source, destination, strerror(errno));
+				close(input);
+				close(output);
+				return -1;
+			}
+			p += w;
+			towrite -= w;
+			bytesCopied += w;
+		}
+	}
+	if(n < 0)
+	{
+		log_warn("copy_file(): Failed to copy \"%s\" to \"%s\": %s", source, destination, strerror(errno));
+		close(input);
+		close(output);
+		return -1;
+	}
+	close(input);
+	close(output);
+
+	return (int)bytesCopied;
+#else
 	// Use sendfile (kernel-space copying as fallback)
 	off_t bytesCopied = 0;
 	struct stat fileinfo = {0};
@@ -428,7 +512,9 @@ static int copy_file(const char *source, const char *destination)
 
 	return result;
 #endif
+#endif // __GLIBC__ guard
 }
+
 
 // Change ownership of file to pihole user
 bool chown_pihole(const char *path, struct passwd *pwd)
@@ -809,11 +895,22 @@ enum verify_result verify_FTL(bool verbose)
 {
 	// Get the filename of the current executable
 	char filename[PATH_MAX] = { 0 };
+#ifdef __FreeBSD__
+	// FreeBSD has no /proc/self/exe; use the KERN_PROC_PATHNAME sysctl instead
+	size_t len = sizeof(filename);
+	if(sysctl((int[]){ CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, getpid() },
+	          4, filename, &len, NULL, 0) != 0)
+	{
+		log_err("Failed to read self filename: %s", strerror(errno));
+		return VERIFY_ERROR;
+	}
+#else
 	if(readlink("/proc/self/exe", filename, sizeof(filename)) == -1)
 	{
 		log_err("Failed to read self filename: %s", strerror(errno));
 		return VERIFY_ERROR;
 	}
+#endif
 
 	// Read the pre-computed hash as well as the checksum mark from the
 	// binary (last 9 + 32 bytes)

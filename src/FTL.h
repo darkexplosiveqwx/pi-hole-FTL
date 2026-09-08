@@ -55,7 +55,21 @@
 #include <netdb.h>
 #include <errno.h>
 #include <pthread.h>
+// Portable thread naming.
+//
+// Linux names the calling thread with prctl(PR_SET_NAME) and reads it back
+// with prctl(PR_GET_NAME). FreeBSD has no prctl; it uses the POSIX
+// pthread_setname_np()/pthread_getname_np() pair instead. These shims keep
+// the two call sites consistent across the code base.
+#ifdef __FreeBSD__
+#include <pthread_np.h> // pthread_setname_np / pthread_getname_np
+#define FTL_set_thread_name(name) pthread_setname_np(pthread_self(), (name))
+#define FTL_get_thread_name(buffer, size) pthread_getname_np(pthread_self(), (buffer), (size))
+#else
 #include <sys/prctl.h>
+#define FTL_set_thread_name(name) prctl(PR_SET_NAME, (name), 0, 0, 0)
+#define FTL_get_thread_name(buffer, size) prctl(PR_GET_NAME, (buffer), 0, 0, 0)
+#endif
 #include <pwd.h>
 // syslog
 #include <syslog.h>
@@ -67,11 +81,21 @@
 #include <assert.h>
 
 // Define MIN and MAX macros, use them only when x and y are of the same type
+#ifdef __FreeBSD__
+#undef MAX // FreeBSD's <sys/param.h> already defines MAX
+#endif
 #define MAX(x,y) (((x) > (y)) ? (x) : (y))
 // MIN(x,y) is already defined in dnsmasq.h
 
 // Number of elements in an array
 #define ArraySize(X) (sizeof(X)/sizeof(*X))
+
+// get_nprocs()/get_nprocs_conf() come from <sys/sysinfo.h> on Linux; FreeBSD
+// provides an equivalent via sysconf(3).
+#ifdef __FreeBSD__
+#define get_nprocs() ((int)sysconf(_SC_NPROCESSORS_ONLN))
+#define get_nprocs_conf() ((int)sysconf(_SC_NPROCESSORS_ONLN))
+#endif
 
 // Constant socket buffer length
 #define SOCKETBUFFERLEN 1024
@@ -194,6 +218,24 @@
 #endif
 #undef strdup // strdup() is a macro in itself, it needs special handling
 #undef free
+// FreeBSD's FORTIFY_SOURCE support (ssp/stdio.h, ssp/string.h) implements
+// sprintf()/strcpy()/... as *macros*, unlike glibc which uses inline functions.
+// FTL replaces these functions with its own checked wrappers below, so the
+// ssp macros must be removed first or the redefinition is a hard error under
+// -Werror,-Wmacro-redefined. On glibc these names are not macros, so the
+// #undefs are harmless no-ops.
+#undef sprintf
+#undef vsprintf
+#undef snprintf
+#undef vsnprintf
+#undef strcpy
+#undef strncpy
+#undef memset
+#undef memcpy
+#undef memmove
+#undef strcat
+#undef strncat
+#undef memcmp
 #define free(ptr) { FTLfree(ptr, __FILE__,  __FUNCTION__,  __LINE__); ptr = NULL; }
 #define strdup(str_in) FTLstrdup(str_in, __FILE__,  __FUNCTION__,  __LINE__)
 #define calloc(numer_of_elements, element_size) FTLcalloc(numer_of_elements, element_size, __FILE__,  __FUNCTION__,  __LINE__)

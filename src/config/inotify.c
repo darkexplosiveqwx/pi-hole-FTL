@@ -13,7 +13,11 @@
 #include "log.h"
 #include <sys/inotify.h>
 // NAME_MAX
+#ifdef __FreeBSD__
+#include <limits.h>
+#else
 #include <linux/limits.h>
+#endif
 // FILE
 #include <stdio.h>
 // sleepms()

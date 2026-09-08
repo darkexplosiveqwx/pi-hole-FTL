@@ -10,7 +10,9 @@
 
 #include "FTL.h"
 #include "netlink.h"
+#ifndef __FreeBSD__
 #include "netlink_consts.h"
+#endif
 #include "log.h"
 // struct config
 #include "config/config.h"
@@ -21,6 +23,20 @@
 
 // defined in src/dnsmasq/rfc1035.c
 extern int private_net(struct in_addr addr, int ban_localhost);
+
+#ifdef __FreeBSD__
+// FreeBSD-specific includes for the non-detailed netlink implementation
+#include <net/if_types.h>    // IFT_ETHER, IFT_LOOP, IFT_PPP, IFT_TUNNEL
+#endif
+
+#ifndef __FreeBSD__
+// The entire Linux netlink implementation below (message parsing, nlquery(),
+// and the individual query helpers) relies on Linux-specific types, macros
+// and headers (rtnetlink, ifaddrmsg, RTA_*, NLMSG_*, RTM_*).  FreeBSD uses a
+// separate implementation based on getifaddrs() and PF_ROUTE sockets (see the
+// #else branch at the bottom of this file).  Keeping the Linux code guarded
+// like this means it is compiled out entirely on FreeBSD rather than forcing
+// every Linux-only helper to carry its own #ifdef.
 
 // Netlink attributes are variable-length: the kernel decides how many bytes it
 // puts into an attribute and is free to send fewer than the attribute's type
@@ -1613,11 +1629,135 @@ static bool nlquery(const int type, cJSON *json, const bool detailed)
  * @param detailed   Boolean flag indicating whether to retrieve detailed information.
  * @return true on success, false on failure.
  */
+#endif /* __FreeBSD__ (end of Linux netlink implementation) */
+
+#ifdef __FreeBSD__
+// FreeBSD implementation: query the routing table via a PF_ROUTE socket
+// and return the default route (gateway + interface).
+bool nlroutes(cJSON *routes, const bool detailed)
+{
+	(void)detailed; // non-detailed implementation ignores this flag
+	log_debug(DEBUG_NETLINK, "Called nlroutes (FreeBSD, detailed = %s)", detailed ? "true" : "false");
+
+	// Open a route socket
+	int fd = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+	if(fd < 0)
+	{
+		log_err("route socket error: %s", strerror(errno));
+		return false;
+	}
+
+	// Build RTM_GET request for the default route (dst = 0.0.0.0/0)
+	char buf[512] = { 0 };
+	struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
+	rtm->rtm_version = RTM_VERSION;
+	rtm->rtm_type = RTM_GET;
+	rtm->rtm_flags = RTF_UP | RTF_GATEWAY;
+	rtm->rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_IFP;
+	rtm->rtm_msglen = sizeof(struct rt_msghdr);
+
+	// Destination: 0.0.0.0/0 (default route)
+	struct sockaddr_in *sin_dst = (struct sockaddr_in *)((char *)rtm + rtm->rtm_msglen);
+	sin_dst->sin_len = sizeof(struct sockaddr_in);
+	sin_dst->sin_family = AF_INET;
+	sin_dst->sin_addr.s_addr = INADDR_ANY;
+	rtm->rtm_msglen += sizeof(struct sockaddr_in);
+
+	// Gateway: will be filled by kernel
+	struct sockaddr_in *sin_gw = (struct sockaddr_in *)((char *)rtm + rtm->rtm_msglen);
+	sin_gw->sin_len = sizeof(struct sockaddr_in);
+	sin_gw->sin_family = AF_INET;
+	sin_gw->sin_addr.s_addr = INADDR_ANY;
+	rtm->rtm_msglen += sizeof(struct sockaddr_in);
+
+	// Interface: will be filled by kernel
+	struct sockaddr_dl *sdl_ifp = (struct sockaddr_dl *)((char *)rtm + rtm->rtm_msglen);
+	sdl_ifp->sdl_len = sizeof(struct sockaddr_dl);
+	sdl_ifp->sdl_family = AF_LINK;
+	rtm->rtm_msglen += sizeof(struct sockaddr_dl);
+
+	// Send request
+	if(write(fd, rtm, rtm->rtm_msglen) < 0)
+	{
+		log_err("route socket write error: %s", strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	// Read response
+	ssize_t n = read(fd, buf, sizeof(buf));
+	close(fd);
+	if(n < (ssize_t)sizeof(struct rt_msghdr))
+	{
+		log_err("route socket read error: %s", strerror(errno));
+		return false;
+	}
+
+	// Parse response
+	struct rt_msghdr *resp = (struct rt_msghdr *)buf;
+	if(resp->rtm_type != RTM_GET || resp->rtm_msglen > n)
+	{
+		log_err("invalid route response");
+		return false;
+	}
+
+	// Extract gateway and interface from response addrs
+	cJSON *route = cJSON_CreateObject();
+	cJSON_AddStringToObject(route, "dst", "default");
+	// We request an AF_INET default route, so the address family is always
+	// IPv4 here.  This mirrors the "family" field the Linux implementation
+	// emits via family_name(rt->rtm_family) and is consumed by
+	// network.c's get_gateway() to match addresses of the same family.
+	cJSON_AddStringReferenceToObject(route, "family", "inet");
+
+	// Walk the sockaddr chain after rt_msghdr.  The response contains
+	// sockaddrs for every bit set in rtm_addrs, in fixed order (RTA_DST,
+	// RTA_GATEWAY, RTA_NETMASK, ..., RTA_IFP, RTA_IFA, ...).  We only care
+	// about the gateway and the outgoing interface, and we stop once both
+	// have been found.
+	char *cp = (char *)(resp + 1);
+	char *end = (char *)resp + resp->rtm_msglen;
+	bool found_gw = false;
+	bool found_ifp = false;
+	while(cp < end && !(found_gw && found_ifp))
+	{
+		struct sockaddr *sa = (struct sockaddr *)cp;
+		if(sa->sa_len == 0)
+			break;
+		if(sa->sa_family == AF_INET && (resp->rtm_addrs & RTA_GATEWAY))
+		{
+			char gw[INET_ADDRSTRLEN];
+			if(inet_ntop(AF_INET, &((struct sockaddr_in *)sa)->sin_addr, gw, sizeof(gw)))
+				cJSON_AddStringToObject(route, "gateway", gw);
+			resp->rtm_addrs &= ~RTA_GATEWAY;
+			found_gw = true;
+		}
+		else if(sa->sa_family == AF_LINK && (resp->rtm_addrs & RTA_IFP))
+		{
+			struct sockaddr_dl *sdl = (struct sockaddr_dl *)sa;
+			if(sdl->sdl_nlen > 0)
+			{
+				char ifname[IF_NAMESIZE];
+				memcpy(ifname, sdl->sdl_data, sdl->sdl_nlen);
+				ifname[sdl->sdl_nlen] = '\0';
+				cJSON_AddStringToObject(route, "oif", ifname);
+			}
+			resp->rtm_addrs &= ~RTA_IFP;
+			found_ifp = true;
+		}
+		cp += SA_SIZE(sa);
+	}
+
+	cJSON_AddItemToArray(routes, route);
+	return true;
+}
+#else
 bool nlroutes(cJSON *routes, const bool detailed)
 {
 	log_debug(DEBUG_NETLINK, "Called nlroutes (detailed = %s)", detailed ? "true" : "false");
 	return nlquery(RTM_GETROUTE, routes, detailed);
 }
+#endif
 
 /**
  * @brief Queries network link address information and populates a cJSON object.
@@ -1630,11 +1770,128 @@ bool nlroutes(cJSON *routes, const bool detailed)
  * @param detailed   Boolean flag indicating whether to retrieve detailed information.
  * @return true on success, false on failure.
  */
+#ifdef __FreeBSD__
+// FreeBSD implementation: use getifaddrs() to enumerate interfaces and their addresses
+bool nladdrs(cJSON *interfaces, const bool detailed)
+{
+	(void)detailed; // non-detailed implementation ignores this flag
+	log_debug(DEBUG_NETLINK, "Called nladdrs (FreeBSD, detailed = %s)", detailed ? "true" : "false");
+
+	struct ifaddrs *ifap = NULL;
+	if(getifaddrs(&ifap) != 0)
+	{
+		log_err("getifaddrs() failed: %s", strerror(errno));
+		return false;
+	}
+
+	for(struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next)
+	{
+		if(ifa->ifa_addr == NULL)
+			continue;
+
+		// Ensure interface object exists
+		cJSON *ifobj = cJSON_GetObjectItem(interfaces, ifa->ifa_name);
+		if(ifobj == NULL)
+		{
+			ifobj = cJSON_CreateObject();
+			cJSON_AddItemToObject(interfaces, ifa->ifa_name, ifobj);
+		}
+
+		// Ensure addresses array exists
+		cJSON *addrs = cJSON_GetObjectItem(ifobj, "addresses");
+		if(addrs == NULL)
+		{
+			addrs = cJSON_CreateArray();
+			cJSON_AddItemToObject(ifobj, "addresses", addrs);
+		}
+
+		cJSON *addr = cJSON_CreateObject();
+
+		// Family
+		if(ifa->ifa_addr->sa_family == AF_INET)
+			cJSON_AddStringToObject(addr, "family", "inet");
+		else if(ifa->ifa_addr->sa_family == AF_INET6)
+			cJSON_AddStringToObject(addr, "family", "inet6");
+		else
+		{
+			cJSON_Delete(addr);
+			continue;
+		}
+
+		// Address
+		char ip[INET6_ADDRSTRLEN];
+		if(ifa->ifa_addr->sa_family == AF_INET)
+		{
+			struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+			if(inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)))
+				cJSON_AddStringToObject(addr, "address", ip);
+		}
+		else if(ifa->ifa_addr->sa_family == AF_INET6)
+		{
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+			if(inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)))
+				cJSON_AddStringToObject(addr, "address", ip);
+		}
+
+		// Netmask / prefixlen
+		if(ifa->ifa_netmask != NULL)
+		{
+			if(ifa->ifa_addr->sa_family == AF_INET)
+			{
+				struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_netmask;
+				uint32_t mask = ntohl(sin->sin_addr.s_addr);
+				int prefixlen = __builtin_popcount(mask);
+				cJSON_AddNumberToObject(addr, "prefixlen", prefixlen);
+			}
+			else if(ifa->ifa_addr->sa_family == AF_INET6)
+			{
+				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
+				int prefixlen = 0;
+				for(int i = 0; i < 16; i++)
+					prefixlen += __builtin_popcount(sin6->sin6_addr.s6_addr[i]);
+				cJSON_AddNumberToObject(addr, "prefixlen", prefixlen);
+			}
+		}
+
+		// Scope (basic)
+		if(ifa->ifa_addr->sa_family == AF_INET6)
+		{
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+			if(IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr))
+				cJSON_AddStringToObject(addr, "scope", "link");
+			else if(IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr))
+				cJSON_AddStringToObject(addr, "scope", "host");
+			else
+				cJSON_AddStringToObject(addr, "scope", "global");
+		}
+		else
+		{
+			cJSON_AddStringToObject(addr, "scope", "global");
+		}
+
+		// Flags
+		cJSON *flags = cJSON_CreateArray();
+		if(ifa->ifa_flags & IFF_UP)
+			cJSON_AddStringToArray(flags, "up");
+		if(ifa->ifa_flags & IFF_LOOPBACK)
+			cJSON_AddStringToArray(flags, "loopback");
+		if(ifa->ifa_flags & IFF_RUNNING)
+			cJSON_AddStringToArray(flags, "running");
+		cJSON_AddItemToObject(addr, "flags", flags);
+
+		cJSON_AddItemToArray(addrs, addr);
+	}
+
+	freeifaddrs(ifap);
+	return true;
+}
+#else
 bool nladdrs(cJSON *interfaces, const bool detailed)
 {
 	log_debug(DEBUG_NETLINK, "Called nladdrs (detailed = %s)", detailed ? "true" : "false");
 	return nlquery(RTM_GETADDR, interfaces, detailed);
 }
+#endif
 
 /**
  * @brief Queries network link information and populates a cJSON object.
@@ -1647,11 +1904,104 @@ bool nladdrs(cJSON *interfaces, const bool detailed)
  * @param detailed   Boolean flag indicating whether to retrieve detailed information.
  * @return true on success, false on failure.
  */
+#ifdef __FreeBSD__
+// FreeBSD implementation: use getifaddrs() to enumerate interfaces
+bool nllinks(cJSON *interfaces, const bool detailed)
+{
+	(void)detailed; // non-detailed implementation ignores this flag
+	log_debug(DEBUG_NETLINK, "Called nllinks (FreeBSD, detailed = %s)", detailed ? "true" : "false");
+
+	struct ifaddrs *ifap = NULL;
+	if(getifaddrs(&ifap) != 0)
+	{
+		log_err("getifaddrs() failed: %s", strerror(errno));
+		return false;
+	}
+
+	for(struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next)
+	{
+		// Only process the first address per interface (AF_LINK) to avoid duplicates
+		if(ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK)
+			continue;
+
+		// Check if we've already processed this interface
+		cJSON *link = cJSON_GetObjectItem(interfaces, ifa->ifa_name);
+		if(link != NULL)
+			continue;
+
+		link = cJSON_CreateObject();
+		cJSON_AddItemToObject(interfaces, ifa->ifa_name, link);
+
+		cJSON_AddStringToObject(link, "name", ifa->ifa_name);
+
+		// Interface index
+		unsigned int ifindex = if_nametoindex(ifa->ifa_name);
+		if(ifindex > 0)
+			cJSON_AddNumberToObject(link, "index", ifindex);
+
+		// Type (from if_data if available, otherwise default to ether)
+		struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+		if(sdl->sdl_type == IFT_ETHER || sdl->sdl_type == IFT_IEEE80211)
+			cJSON_AddStringToObject(link, "type", "ether");
+		else if(sdl->sdl_type == IFT_LOOP)
+			cJSON_AddStringToObject(link, "type", "loopback");
+		else if(sdl->sdl_type == IFT_PPP)
+			cJSON_AddStringToObject(link, "type", "ppp");
+		else if(sdl->sdl_type == IFT_TUNNEL)
+			cJSON_AddStringToObject(link, "type", "tunnel");
+		else
+			cJSON_AddStringToObject(link, "type", "unknown");
+
+		// MAC address
+		if(sdl->sdl_alen == 6)
+		{
+			unsigned char *mac = (unsigned char *)LLADDR(sdl);
+			char mac_str[18];
+			snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+			         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+			cJSON_AddStringToObject(link, "address", mac_str);
+		}
+
+		// Flags
+		cJSON *flags = cJSON_CreateArray();
+		if(ifa->ifa_flags & IFF_UP)
+			cJSON_AddStringToArray(flags, "up");
+		if(ifa->ifa_flags & IFF_BROADCAST)
+			cJSON_AddStringToArray(flags, "broadcast");
+		if(ifa->ifa_flags & IFF_LOOPBACK)
+			cJSON_AddStringToArray(flags, "loopback");
+		if(ifa->ifa_flags & IFF_POINTOPOINT)
+			cJSON_AddStringToArray(flags, "pointopoint");
+		if(ifa->ifa_flags & IFF_RUNNING)
+			cJSON_AddStringToArray(flags, "running");
+		if(ifa->ifa_flags & IFF_NOARP)
+			cJSON_AddStringToArray(flags, "noarp");
+		if(ifa->ifa_flags & IFF_PROMISC)
+			cJSON_AddStringToArray(flags, "promisc");
+		if(ifa->ifa_flags & IFF_ALLMULTI)
+			cJSON_AddStringToArray(flags, "allmulti");
+		if(ifa->ifa_flags & IFF_MULTICAST)
+			cJSON_AddStringToArray(flags, "multicast");
+		cJSON_AddItemToObject(link, "flags", flags);
+
+		// MTU
+		if(ifa->ifa_data != NULL)
+		{
+			// if_data is only available if we use ifmib, not getifaddrs
+			// For now, skip MTU in non-detailed mode
+		}
+	}
+
+	freeifaddrs(ifap);
+	return true;
+}
+#else
 bool nllinks(cJSON *interfaces, const bool detailed)
 {
 	log_debug(DEBUG_NETLINK, "Called nllinks (detailed = %s)", detailed ? "true" : "false");
 	return nlquery(RTM_GETLINK, interfaces, detailed);
 }
+#endif
 
 /**
  * @brief Reads the ARP cache using netlink and fills a cJSON array with entries.
@@ -1660,11 +2010,23 @@ bool nllinks(cJSON *interfaces, const bool detailed)
  * @param arp_entries cJSON array to fill with ARP entries
  * @return true on success, false on failure
  */
+#ifdef __FreeBSD__
+// FreeBSD implementation: the full ARP/NDP cache would require parsing a
+// sysctl(CTL_NET, PF_ROUTE, NET_RT_DUMP, ...) dump; the non-detailed version
+// returns an empty array for now.
+bool nlneigh(cJSON *arp_entries)
+{
+	(void)arp_entries;
+	log_debug(DEBUG_NETLINK, "Called nlneigh (FreeBSD, returning empty array)");
+	return true;
+}
+#else
 bool nlneigh(cJSON *arp_entries)
 {
 	log_debug(DEBUG_NETLINK, "Called nlneigh");
 	return nlquery(RTM_GETNEIGH, arp_entries, false);
 }
+#endif
 
 /**
  * @brief Retrieves the name of the default gateway.

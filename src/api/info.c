@@ -12,8 +12,23 @@
 #include "webserver/http-common.h"
 #include "webserver/json_macros.h"
 #include "api/api.h"
-// sysinfo(), get_nprocs_conf()
+// sysinfo(), get_nprocs_conf() (Linux only)
+#ifndef __FreeBSD__
 #include <sys/sysinfo.h>
+#else
+// clock_gettime(), CLOCK_UPTIME
+#include <time.h>
+// getloadavg()
+#include <stdlib.h>
+// sysctlbyname() (note: <sys/user.h> is deliberately NOT included here as
+// it pulls in <sys/proc.h> whose struct session collides with api/auth.h)
+#include <sys/sysctl.h>
+#endif
+// SI_LOAD_SHIFT is the kernel's fixed-point shift for load averages (see
+// <linux/sysinfo.h> on Linux; defined manually on FreeBSD)
+#ifndef SI_LOAD_SHIFT
+#define SI_LOAD_SHIFT 16
+#endif
 // get_blockingstatus()
 #include "config/setupVars.h"
 // counters
@@ -174,9 +189,49 @@ int get_system_obj(struct ftl_conn *api, cJSON *system)
 	// of available (= online) processors can be lower than the total number
 	//  (= configured) of processors
 	const int nprocs = get_nprocs_conf();
+#ifdef __FreeBSD__
+	// There is no sysinfo() on FreeBSD; gather the equivalent data from
+	// sysctls and libc calls instead. All values are stored in the same
+	// layout as Linux' struct sysinfo so the code below stays shared.
+	struct {
+		long uptime;                  // seconds since boot
+		unsigned long totalswap;      // total swap, in bytes
+		unsigned long freeswap;       // free swap, in bytes
+		unsigned short procs;         // number of running processes
+		unsigned long loads[3];       // 1/5/15 min load averages (fixed point)
+		unsigned int mem_unit;        // memory unit (1 => values in bytes)
+	} info = { .mem_unit = 1 };
+
+	// Seconds since boot
+	struct timespec uptime_ts;
+	if(clock_gettime(CLOCK_UPTIME, &uptime_ts) == 0)
+		info.uptime = (long)uptime_ts.tv_sec;
+
+	// Swap: FreeBSD has no "vm.swap_free" sysctl; the free space is
+	// total minus the bytes reserved to back anonymous memory (tuning(7)).
+	uint64_t swap_total = 0, swap_reserved = 0;
+	size_t len = sizeof(swap_total);
+	sysctlbyname("vm.swap_total", &swap_total, &len, NULL, 0);
+	len = sizeof(swap_reserved);
+	sysctlbyname("vm.swap_reserved", &swap_reserved, &len, NULL, 0);
+	info.totalswap = swap_total;
+	info.freeswap = (swap_total >= swap_reserved) ? (swap_total - swap_reserved) : 0;
+
+	// Number of processes
+	info.procs = count_processes();
+
+	// Load averages
+	double lda[3] = { 0 };
+	if(getloadavg(lda, 3) == 3)
+	{
+		for(int i = 0; i < 3; i++)
+			info.loads[i] = (unsigned long)(lda[i] * (1 << SI_LOAD_SHIFT));
+	}
+#else
 	struct sysinfo info;
 	if(sysinfo(&info) != 0)
 		return send_json_error(api, 500, "error", strerror(errno), NULL);
+#endif
 
 	// Seconds since boot
 	JSON_ADD_NUMBER_TO_OBJECT(system, "uptime", info.uptime);
@@ -516,7 +571,17 @@ static int get_host_obj(struct ftl_conn *api, cJSON *host)
 	cJSON *uname_ = JSON_NEW_OBJECT();
 	struct utsname un = { 0 };
 	uname(&un);
+#ifdef __FreeBSD__
+	// FreeBSD's struct utsname has no domainname member; get the domain
+	// name via getdomainname() instead (bounded by the domain-name limit)
+	char domain[256] = { 0 };
+	if(getdomainname(domain, sizeof(domain)) != 0)
+		domain[0] = '\0';
+	domain[sizeof(domain) - 1] = '\0';
+	JSON_COPY_STR_TO_OBJECT(uname_, "domainname", domain);
+#else
 	JSON_COPY_STR_TO_OBJECT(uname_, "domainname", un.domainname);
+#endif
 	JSON_COPY_STR_TO_OBJECT(uname_, "machine", un.machine);
 	JSON_COPY_STR_TO_OBJECT(uname_, "nodename", un.nodename);
 	JSON_COPY_STR_TO_OBJECT(uname_, "release", un.release);

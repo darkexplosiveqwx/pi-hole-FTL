@@ -1230,7 +1230,11 @@ bool _FTL_new_query(const unsigned int flags, const char *name,
 	// Try to obtain MAC address from dnsmasq's cache (also asks the kernel)
 	// Don't do this for internally generated queries (e.g., DNSSEC), if the
 	// MAC address is already known or if the netlink socket is not available
-	// (e.g., when retrying a query using TCP after UDP truncation)
+	// (e.g., when retrying a query using TCP after UDP truncation).
+	// find_mac() relies on the Linux netlink ARP enumeration; FreeBSD has no
+	// netlink socket (HAVE_BSD_NETWORK provides a routing socket instead), so
+	// this cache-based MAC lookup is compiled out there.
+#ifdef HAVE_LINUX_NETWORK
 	if(!internal_query && client->hwlen < 1 && daemon->netlinkfd > 0)
 	{
 		// find_mac() may trigger a netlink kernel call
@@ -1280,6 +1284,7 @@ bool _FTL_new_query(const unsigned int flags, const char *name,
 			}
 		}
 	}
+#endif /* HAVE_LINUX_NETWORK */
 
 	bool blockDomain = false;
 	// Check if this should be blocked only for active queries

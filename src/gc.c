@@ -26,8 +26,13 @@
 #include "database/query-table.h"
 // logg_rate_limit_message()
 #include "database/message-table.h"
-// get_nprocs()
+// get_nprocs() (get_nprocs_conf() is provided via FTL.h on FreeBSD)
+#ifndef __FreeBSD__
 #include <sys/sysinfo.h>
+#else
+// getloadavg()
+#include <stdlib.h>
+#endif
 // get_path_usage()
 #include "files.h"
 // void calc_cpu_usage()
@@ -365,6 +370,12 @@ static int check_space(const char *file, unsigned int LastUsage)
 
 static int getloadavg_proc(double loadavg[3])
 {
+#ifdef __FreeBSD__
+	// FreeBSD provides getloadavg() directly; there is no /proc/loadavg
+	if(getloadavg(loadavg, 3) != 3)
+		return -1;
+	return 0;
+#else
 	FILE *f = fopen("/proc/loadavg", "r");
 	if(f == NULL)
 		return -1;
@@ -375,6 +386,7 @@ static int getloadavg_proc(double loadavg[3])
 		return -1;
 
 	return 0;
+#endif
 }
 
 static void check_load(void)
@@ -606,7 +618,7 @@ void *GC_thread(void *val)
 	(void)val; // Mark parameter as unused
 
 	// Set thread name
-	prctl(PR_SET_NAME, thread_names[GC], 0, 0, 0);
+	FTL_set_thread_name(thread_names[GC]);
 
 	// Remember when we last ran the actions
 	time_t lastGCrun = time(NULL) - time(NULL)%GCinterval;
