@@ -11,6 +11,9 @@
 #include "FTL.h"
 #define SHMEM_PRIVATE
 #include "shmem.h"
+#ifdef __FreeBSD__
+#include <sys/file.h>   // flock()
+#endif
 #include "overTime.h"
 #include "log.h"
 #include "config/config.h"
@@ -77,6 +80,10 @@ ASSERT_SHM_SIZE(countersStruct,        356,    356,    356);
 
 /// The name of the shared memory. Use this when connecting to the shared memory.
 #define SHMEM_PATH "/dev/shm"
+// FreeBSD does not allow locking shared-memory objects (see create_shm()); the
+// exclusive liveness lock is taken on a regular file in this directory (the
+// process-local tmpfs) instead.
+#define SHMEM_LOCKDIR "/tmp/"
 #define SHARED_LOCK_NAME "lock"
 #define SHARED_STRINGS_NAME "strings"
 #define SHARED_COUNTERS_NAME "counters"
@@ -215,6 +222,34 @@ void reset_lock_owner_cache(void)
 	// thread-local storage (stale TID).
 	cached_pid = 0;
 	cached_tid = 0;
+}
+
+// Take an exclusive advisory lock on the given file descriptor. BSD and Linux
+// both support flock(), but record locks via fcntl(F_SETLK) only work on
+// regular files; FreeBSD's shared-memory objects (*.so) reject them with
+// EBADF. flock() is therefore used on a sidecar lock file whenever the backing
+// object is not a regular file.
+static bool lock_shm_fd(const int fd)
+{
+#ifdef __FreeBSD__
+	return flock(fd, LOCK_EX | LOCK_NB) == 0;
+#else
+	struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET,
+	                      .l_start = 0,      .l_len = 0 };
+	return fcntl(fd, F_SETLK, &lock) == 0;
+#endif
+}
+
+// Release the advisory lock acquired by lock_shm_fd()
+static void unlock_shm_fd(const int fd)
+{
+#ifdef __FreeBSD__
+	flock(fd, LOCK_UN);
+#else
+	struct flock lock = { .l_type = F_UNLCK, .l_whence = SEEK_SET,
+	                      .l_start = 0,      .l_len = 0 };
+	fcntl(fd, F_SETLK, &lock);
+#endif
 }
 static size_t get_optimal_object_size(const size_t objsize, const size_t minsize);
 
@@ -1083,18 +1118,68 @@ static bool create_shm(const char *suffix, SharedMemory *sharedMemory, const siz
 		return sharedMemory;
 	}
 
-	// Create exclusive file lock on shared memory object
-	// The lock will be automatically released when the file descriptor is closed
-	sharedMemory->lock.l_type = F_WRLCK; // write = exclusive lock
-	sharedMemory->lock.l_whence = SEEK_SET;
-	sharedMemory->lock.l_start = 0; // lock everything from the start ...
-	sharedMemory->lock.l_len = 0; // ... to the end of the file (magic 0 = EOF)
-
-	// Try to lock the shared memory object
-	if(fcntl(sharedMemory->fd, F_SETLK, &sharedMemory->lock) == -1)
+	// Remember the object's device/inode so the cached fd can be validated
+	// later (see get_shm_fd())
+	struct stat shmstat;
+	if(fstat(sharedMemory->fd, &shmstat) != 0)
+		log_warn("create_shm(): fstat(%i) failed: %s", sharedMemory->fd, strerror(errno));
+	else
 	{
-		log_err("create_shm(): Failed to exclusively lock shared memory object \"%s\": %s",
+		sharedMemory->dev = shmstat.st_dev;
+		sharedMemory->ino = shmstat.st_ino;
+	}
+
+	// Create exclusive lock on the shared memory object. The lock is a
+	// process-liveness marker: it is automatically released when the
+	// process exits or crashes.
+	//
+	// FreeBSD reports its shared-memory objects as regular files, yet neither
+	// fcntl() record locks nor flock() work on them (EOPNOTSUPP), so on that
+	// platform the lock is taken on an auxiliary regular lock file in the
+	// process-local tmpfs (/tmp) instead. The lock file is left on /tmp; it is
+	// tiny and cleared on every boot.
+	sharedMemory->lockfd = -1;
+#ifdef __FreeBSD__
+	const size_t locknamelen = strlen(name) + sizeof(SHMEM_LOCKDIR) + sizeof(".lock");
+	char *lockname = calloc(locknamelen, sizeof(char));
+	if(lockname == NULL)
+		log_err("create_shm(): Failed to allocate memory for lock file name");
+	else
+	{
+		snprintf(lockname, locknamelen, SHMEM_LOCKDIR "%s.lock", name);
+		sharedMemory->lockfd = open(lockname, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
+		free(lockname);
+	}
+	if(sharedMemory->lockfd == -1)
+		log_err("create_shm(): Failed to create lock file for \"%s\": %s",
 		        name, strerror(errno));
+#else
+	// Lock the shared-memory object itself, which is only possible if it is
+	// a regular file accessible through the filesystem (which /dev/shm tmpfs
+	// provides on Linux).
+	struct stat objstat;
+	if(fstat(sharedMemory->fd, &objstat) == 0 && S_ISREG(objstat.st_mode))
+		sharedMemory->lockfd = sharedMemory->fd;
+	else
+		log_err("create_shm(): Refusing to lock non-regular shared memory object \"%s\"", name);
+#endif
+	if(sharedMemory->lockfd != -1)
+	{
+		if(lock_shm_fd(sharedMemory->lockfd))
+		{
+			log_debug(DEBUG_SHMEM, "Locked %s (%i)", sharedMemory->lockfd == sharedMemory->fd ? "shared memory object" : "lock file", sharedMemory->lockfd);
+		}
+		else
+		{
+			log_err("create_shm(): Failed to exclusively lock shared memory object \"%s\": %s",
+			        name, strerror(errno));
+			if(sharedMemory->lockfd != sharedMemory->fd)
+				close(sharedMemory->lockfd);
+			sharedMemory->lockfd = -1;
+		}
+	}
+	if(sharedMemory->lockfd == -1)
+	{
 		close(sharedMemory->fd);
 		return sharedMemory;
 	}
@@ -1229,6 +1314,33 @@ void init_queries_shm_sz(void)
 	queries = enlarge_shmem_struct(QUERIES, counters->queries);
 }
 
+// Return the file descriptor of a shared-memory object, re-opening it by name
+// if the cached fd no longer refers to the object. The embedded dnsmasq closes
+// all lingering file descriptors when it initializes on FreeBSD (it cannot
+// enumerate /proc/self/fd, so it falls back to closing every descriptor it may
+// have inherited), which can leave a cached fd either closed or reused for an
+// unrelated, possibly non-seekable file.
+static int get_shm_fd(SharedMemory *sharedMemory)
+{
+	struct stat shmstat;
+	if(sharedMemory->fd >= 0 && sharedMemory->dev != 0 &&
+	   fstat(sharedMemory->fd, &shmstat) == 0 &&
+	   shmstat.st_dev == sharedMemory->dev &&
+	   shmstat.st_ino == sharedMemory->ino)
+		return sharedMemory->fd;
+
+	// The cached fd is stale: re-attach to the object by name
+	const int fd = shm_open(sharedMemory->name, O_RDWR, S_IRUSR | S_IWUSR);
+	if(fd == -1)
+	{
+		log_crit("get_shm_fd(): Failed to re-open shared memory object \"%s\": %s",
+		         sharedMemory->name, strerror(errno));
+		return -1;
+	}
+	sharedMemory->fd = fd;
+	return fd;
+}
+
 static bool realloc_shm(SharedMemory *sharedMemory, const size_t size1, const size_t size2, const bool resize)
 {
 	// Absolute target size
@@ -1260,11 +1372,17 @@ static bool realloc_shm(SharedMemory *sharedMemory, const size_t size1, const si
 	// TCP requests.
 	if(resize)
 	{
+		// Refresh the (possibly stale, see get_shm_fd()) cached descriptor
+		// before growing the object
+		const int fd = get_shm_fd(sharedMemory);
+		if(fd == -1)
+			exit(EXIT_FAILURE);
+
 		// Allocate shared memory object to specified size
 		// Using f[tl]allocate() will ensure that there's actually space for
 		// this file. Otherwise we end up with a sparse file that can give
 		// SIGBUS if we run out of space while writing to it.
-		const int ret = ftlallocate(sharedMemory->fd, 0U, new_size);
+		const int ret = ftlallocate(fd, 0U, new_size);
 		if(ret != 0)
 		{
 			log_crit("realloc_shm(): Failed to resize \"%s\" (%i) to %zu: %s (%i)",
@@ -1281,8 +1399,11 @@ static bool realloc_shm(SharedMemory *sharedMemory, const size_t size1, const si
 	// FreeBSD has no mremap(); unmap the old mapping and re-map the (already
 	// enlarged by ftlallocate() above) shared-memory object at a fresh
 	// address with the new size.
+	const int fd = get_shm_fd(sharedMemory);
+	if(fd == -1)
+		exit(EXIT_FAILURE);
 	void *new_ptr = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-	                     sharedMemory->fd, 0);
+	                     fd, 0);
 	if(new_ptr == MAP_FAILED)
 	{
 		log_crit("realloc_shm(): mmap(%zu): Failed to remap \"%s\": %s",
@@ -1353,10 +1474,34 @@ static void delete_shm(SharedMemory *sharedMemory)
 	// Set unmapped pointer to NULL
 	sharedMemory->ptr = NULL;
 
-	// Close shared memory file descriptor
+	// The liveness lock may reside on a separate file descriptor (FreeBSD).
+	// Resolve this before the shared-memory fd is closed below.
+	const bool separate_lockfd = sharedMemory->lockfd > -1 && sharedMemory->lockfd != sharedMemory->fd;
+
+	// Close the shared memory file descriptor if it still refers to our
+	// object. The fd may have been closed (or reused for an unrelated file)
+	// by dnsmasq's startup fd cleanup on FreeBSD; closing a reused descriptor
+	// would be wrong.
+	struct stat shmstat;
+	const bool fd_valid = sharedMemory->fd > -1 && sharedMemory->dev != 0 &&
+	                      fstat(sharedMemory->fd, &shmstat) == 0 &&
+	                      shmstat.st_dev == sharedMemory->dev &&
+	                      shmstat.st_ino == sharedMemory->ino;
+	if(!fd_valid)
+		sharedMemory->fd = -1;
 	if(sharedMemory->fd > -1 && close(sharedMemory->fd) != 0)
 		log_warn("delete_shm(): close(%i) failed: %s", sharedMemory->fd, strerror(errno));
 	sharedMemory->fd = -1;
+
+	// Release the separate liveness lock, if any. This is a no-op on
+	// platforms where the lock resides on the shared-memory object itself.
+	if(separate_lockfd)
+	{
+		unlock_shm_fd(sharedMemory->lockfd);
+		if(close(sharedMemory->lockfd) != 0)
+			log_warn("delete_shm(): close(%i) failed: %s", sharedMemory->lockfd, strerror(errno));
+	}
+	sharedMemory->lockfd = -1;
 
 	// Now you can no longer `shm_open` the memory, and once all others
 	// unlink, it will be destroyed.

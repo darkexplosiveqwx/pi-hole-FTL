@@ -231,6 +231,13 @@ endif()
 # -FILE_OFFSET_BITS=64: used by stat(). Avoids problems with files > 2 GB on 32bit machines
 # We define HAVE_POLL_H as this is needed for the musl builds to succeed
 set(CMAKE_C_FLAGS "-std=c17 -pipe ${WARN_FLAGS} -D_FILE_OFFSET_BITS=64 ${HARDENING_FLAGS} ${DEBUG_FLAGS} ${CMAKE_C_FLAGS} -DHAVE_POLL_H ${SQLITE_DEFINES}")
+# Native FreeBSD builds keep ports-installed third-party headers (nettle,
+# libidn2, OpenSSL, ...) under /usr/local/include, which the base compiler
+# does not search by default. Not applied when cross-compiling, where the
+# toolchain file already points the sysroot at the correct include paths.
+if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" AND NOT CMAKE_CROSSCOMPILING)
+    string(APPEND CMAKE_C_FLAGS " -I/usr/local/include")
+endif()
 
 # -Wp,-D_FORTIFY_SOURCE=3 and -O1 or higher: This causes certain unsafe glibc functions to be replaced with their safer counterparts. _FORTIFY_SOURCE requires -O1 or higher to build. We may have to undefine _FORTIFY_SOURCE to avoid a warning about the redefinition of this macro
 set(CMAKE_C_FLAGS_DEBUG "-O0 -g3")

@@ -31,6 +31,15 @@ typedef struct {
 	size_t size;
 	void *ptr;
 	int fd;
+	int lockfd;
+	// Device and inode of the shared-memory object, used to detect that the
+	// cached fd still refers to the original object (see get_shm_fd()).
+	// The embedded dnsmasq closes all lingering file descriptors during its
+	// initialization on FreeBSD (no /proc to enumerate them, so it falls back
+	// to closing every descriptor), which would otherwise leave the cached fd
+	// point at an unrelated, possibly non-seekable file.
+	dev_t dev;
+	ino_t ino;
 	struct flock lock;
 } SharedMemory;
 
