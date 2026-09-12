@@ -28,10 +28,15 @@ FTL_URL = "http://127.0.0.1"
 # DNSSEC-dependent counters below flaky.  If you add or remove queries in
 # test_suite.bats, update these.
 
-TOTAL       = 131
+TOTAL       = 137
 FORWARDED   = 41
 DNSKEY      = 4
 TOP_DOMAIN  = "localhost"
+
+# The bats suite additionally exercises log reopen via SIGUSR2, firing five
+# "dig A denied.ftl" queries (127.0.0.1) and one over IPv6 (::1) - six more
+# DENYLIST-blocked A records and one extra client; see
+# "SIGUSR2 log reopen keeps the DNS listeners alive" in test_suite.bats.
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +597,7 @@ class TestStatsSummary:
         data = _j(api_session.get(f"{FTL_URL}/api/stats/summary", timeout=5), dump="stats_summary")
         q = data["queries"]
         assert q["total"] == TOTAL, json.dumps(data, indent=2)
-        assert q["blocked"] == 49
+        assert q["blocked"] == 55
         assert q["forwarded"] == FORWARDED
         assert q["cached"] == 41
         assert q["unique_domains"] == 77
@@ -601,13 +606,13 @@ class TestStatsSummary:
         assert q["status"]["FORWARDED"] == FORWARDED
         assert q["status"]["CACHE"] == 41
         assert q["status"]["REGEX"] == 21
-        assert q["status"]["DENYLIST"] == 4
+        assert q["status"]["DENYLIST"] == 10
         assert q["status"]["SPECIAL_DOMAIN"] == 2
-        assert q["types"]["A"] == 69
+        assert q["types"]["A"] == 75
         assert q["types"]["AAAA"] == 19
 
-        assert data["clients"]["active"] == 11
-        assert data["clients"]["total"] == 11
+        assert data["clients"]["active"] == 12
+        assert data["clients"]["total"] == 12
         assert data["gravity"]["domains_being_blocked"] == 8
 
 
@@ -625,7 +630,7 @@ class TestStatsTopDomains:
         assert counts == sorted(counts, reverse=True), \
             f"Not sorted descending: {counts}"
         assert data["total_queries"] == TOTAL
-        assert data["blocked_queries"] == 49
+        assert data["blocked_queries"] == 55
 
     def test_top_domains_blocked(self, api_session):
         data = _j(api_session.get(f"{FTL_URL}/api/stats/top_domains?blocked=true", timeout=5))
@@ -723,7 +728,7 @@ class TestStatsUpstreams:
         assert data["forwarded_queries"] == FORWARDED
 
         blocklist = next(u for u in upstreams if u["ip"] == "blocklist")
-        assert blocklist["count"] == 49
+        assert blocklist["count"] == 55
         assert blocklist["port"] == -1
 
         cache = next(u for u in upstreams if u["ip"] == "cache")
@@ -740,7 +745,7 @@ class TestStatsQueryTypes:
     def test_query_types(self, api_session):
         data = _j(api_session.get(f"{FTL_URL}/api/stats/query_types", timeout=5), dump="query_types")
         assert data["types"] == {
-            "A": 69, "AAAA": 19, "ANY": 3, "SRV": 1, "SOA": 0,
+            "A": 75, "AAAA": 19, "ANY": 3, "SRV": 1, "SOA": 0,
             "PTR": 8, "TXT": 10, "NAPTR": 1, "MX": 1, "DS": 6,
             "RRSIG": 0, "DNSKEY": DNSKEY, "NS": 0, "SVCB": 3, "HTTPS": 3,
             "OTHER": 1,
@@ -867,8 +872,8 @@ class TestInfo:
         assert db["regex"]["allowed"] == {"total": 2, "enabled": 2}
         assert db["regex"]["denied"] == {"total": 11, "enabled": 11}
         assert ftl["privacy_level"] == 0
-        assert ftl["clients"]["total"] == 11
-        assert ftl["clients"]["active"] == 11
+        assert ftl["clients"]["total"] == 12
+        assert ftl["clients"]["active"] == 12
 
     def test_info_login(self, api_session):
         data = _j(api_session.get(f"{FTL_URL}/api/info/login", timeout=5))
@@ -993,13 +998,13 @@ class TestPADD:
         data = _j(api_session.get(f"{FTL_URL}/api/padd", timeout=5), dump="padd")
         assert data["blocking"] == "enabled"
         assert data["gravity_size"] == 8
-        assert data["active_clients"] == 11
+        assert data["active_clients"] == 12
         assert data["top_domain"] == TOP_DOMAIN
         assert data["top_blocked"] == "gravity.ftl"
         assert data["top_client"] == "127.0.0.1"
         q = data["queries"]
         assert q["total"] == TOTAL, json.dumps(data, indent=2)
-        assert q["blocked"] == 49
+        assert q["blocked"] == 55
         cache = data["cache"]
         assert cache["size"] == 10000
 
