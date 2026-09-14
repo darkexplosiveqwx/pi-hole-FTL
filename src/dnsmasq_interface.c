@@ -4329,7 +4329,7 @@ void FTL_dnsmasq_log(const char *payload, const int priority, const char *func, 
 	// Route to JSON output
 	if(config.files.log.destination.v.log_destination == LOG_DEST_JSON && !daemonmode)
 	{
-		write_json_log(time(NULL), prio, "dnsmasq", payload);
+		write_json_log(double_time(), prio, "dnsmasq", payload);
 	}
 
 	// Write to pihole.log via shared writer (FTL owns this file now).

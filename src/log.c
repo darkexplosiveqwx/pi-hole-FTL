@@ -293,17 +293,14 @@ unsigned int get_year(const time_t timein)
 	return tm.tm_year + 1900;
 }
 
-static void get_timestr_iso8601(char timestring[TIMESTR_SIZE], const time_t timein)
+// Get an ISO-8601 timestamp string for JSON logging.
+static void get_timestr_iso8601(char timestring[TIMESTR_SIZE], const double timein)
 {
+	const time_t seconds = (time_t)timein;
 	struct tm tm;
-	gmtime_r(&timein, &tm);
+	gmtime_r(&seconds, &tm);
 
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-
-	int millisec = 0;
-	if(tv.tv_sec == timein)
-		millisec = tv.tv_usec / 1000;
+	const int millisec = (int)((timein - seconds) * 1000.0);
 
 	snprintf(timestring, TIMESTR_SIZE,
 	         "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
@@ -377,7 +374,7 @@ static size_t json_escape(char *out, const size_t outlen, const char *in)
 // write it to stdout.  Only the message field needs escaping; the
 // other four are controlled by the caller.  Uses write() instead of
 // printf() to avoid stdio buffering.
-void write_json_log(const time_t now, const char *log_level, const char *component, const char *msg)
+void write_json_log(const double now, const char *log_level, const char *component, const char *msg)
 {
 	char timestring_iso8601[TIMESTR_SIZE];
 	get_timestr_iso8601(timestring_iso8601, now);
@@ -588,7 +585,7 @@ bool FTL_write_dnsmasq_log(const char *message, const char *func)
 void __attribute__ ((format (printf, 3, 4))) _FTL_log(const int priority, const enum debug_flag flag, const char *format, ...)
 {
 	char timestring[TIMESTR_SIZE];
-	const time_t now = time(NULL);
+	const double now = double_time();
 	va_list args;
 
 	// We have been explicitly asked to not print anything to the log
