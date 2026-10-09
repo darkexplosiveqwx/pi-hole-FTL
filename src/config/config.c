@@ -2136,7 +2136,7 @@ bool getLogFilePath(bool try_read)
 		CONFIG_ADD_ENUM_OPTIONS(config.files.log.destination.a, log_destination);
 	}
 	config.files.log.destination.t = CONF_ENUM_LOG_DESTINATION;
-	config.files.log.destination.f = FLAG_READ_ONLY;
+	config.files.log.destination.f = FLAG_API_CLI_READ_ONLY;
 	config.files.log.destination.d.log_destination = LOG_DEST_FILE;
 	config.files.log.destination.c = validate_stub;
 
