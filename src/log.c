@@ -437,7 +437,7 @@ void write_json_log(const double now, const char *log_level, const char *compone
 		off = sizeof(line) - 1;
 
 	// Use write() to avoid stdio buffering
-	write(STDOUT_FILENO, line, off);
+	(void)write(STDOUT_FILENO, line, off);
 }
 
 bool __attribute__((pure)) FTL_want_stdout(void)
