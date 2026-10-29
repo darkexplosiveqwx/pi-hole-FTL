@@ -34,7 +34,7 @@ target_compile_definitions(civetweb PRIVATE NO_CGI
                                             NO_SSL
                                             USE_IPV6
                                             USE_LUA
-                                            USE_STACK_SIZE=1048576
+                                            USE_STACK_SIZE=2097152
                                             TIMER_RESOLUTION=1000)
 
 include_directories(${PROJECT_SOURCE_DIR}/src/lua)
